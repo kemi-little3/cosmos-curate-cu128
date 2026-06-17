@@ -1,0 +1,119 @@
+{{- if .Values.metrics.enabled }}
+{{- $replicas := .Values.replicas | int }}
+{{- $svc := .Values.helmChartServiceName }}
+{{- $targets := list }}
+{{- range $i, $e := until $replicas }}
+  {{- $targets = append $targets (printf "%s-%d.%s-headless:%d" $svc $i $svc ($.Values.metrics.port | int)) }}
+{{- end }} 
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+data:
+  relay: |
+    receivers:
+      prometheus:
+        config:
+          scrape_configs:
+            {{- $jobs := deepCopy (default (list) .Values.metrics.prometheus.scrapeConfigs) }}
+            {{- if gt (len $jobs) 0 }}
+            {{- $first := index $jobs 0 }}
+            {{- if not (hasKey $first "static_configs") }}
+            {{- $_ := set $first "static_configs" (list (dict "targets" $targets)) }}
+            {{- end }}
+            {{- end }}
+            {{- toYaml $jobs | nindent 12 }}
+
+    exporters:
+      {{- if .Values.metrics.remoteWrite.enabled }}
+      prometheusremotewrite:
+        endpoint: {{ .Values.metrics.remoteWrite.endpoint | quote }}
+        tls:
+          cert_file: {{ .Values.metrics.remoteWrite.certPath | quote }}
+          key_file: {{ .Values.metrics.remoteWrite.keyPath | quote }}
+        external_labels:
+          {{- $labels := deepCopy .Values.metrics.extraExternalLabels }}
+          {{- $labels := merge $labels .Values.metrics.externalLabels }}
+          {{- $labels := set $labels "namespace" "${POD_NS}" }}
+          {{- toYaml $labels | nindent 10 }}
+        write_buffer_size: 524288
+        timeout: 30s
+        max_batch_request_parallelism: 4 
+        remote_write_queue:
+          queue_size: 10000
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 30s
+          max_elapsed_time: 300s
+      {{- end }}
+      {{- if .Values.metrics.otlp.enabled }}
+      otlphttp/metrics:
+        metrics_endpoint: {{ .Values.metrics.otlp.endpoint | quote }}
+        {{- if or .Values.metrics.otlp.certPath .Values.metrics.otlp.keyPath }}
+        tls:
+          {{- if .Values.metrics.otlp.certPath }}
+          cert_file: {{ .Values.metrics.otlp.certPath | quote }}
+          {{- end }}
+          {{- if .Values.metrics.otlp.keyPath }}
+          key_file: {{ .Values.metrics.otlp.keyPath | quote }}
+          {{- end }}
+          insecure_skip_verify: {{ .Values.metrics.otlp.insecureSkipVerify | default false }}
+        {{- end }}
+        timeout: 30s
+        sending_queue:
+          queue_size: 10000
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 30s
+          max_elapsed_time: 300s
+      {{- end }}
+    extensions:
+      health_check:
+        endpoint: ${env:MY_POD_IP}:13133          
+    processors:
+      batch: {}
+      memory_limiter:
+        check_interval: 5s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+      {{- if .Values.metrics.otlp.enabled }}
+      attributes/external-labels:
+        actions:
+          {{- $labels := deepCopy .Values.metrics.extraExternalLabels }}
+          {{- $labels = merge $labels .Values.metrics.externalLabels }}
+          {{- $labels = set $labels "namespace" "${POD_NS}" }}
+          {{- range $k, $v := $labels }}
+          - key: {{ $k | quote }}
+            value: {{ $v | quote }}
+            action: upsert
+          {{- end }}
+      {{- end }}
+    service:
+      extensions:
+      - health_check
+      pipelines:
+        metrics:
+          receivers: [prometheus]
+          processors: [
+            {{- $processors := list "batch" }}
+            {{- if .Values.metrics.otlp.enabled }}
+              {{- $processors = append $processors "attributes/external-labels" }}
+            {{- end }}
+            {{- $processors | join ", " -}}
+          ]
+          exporters: [
+            {{- $exporters := list }}
+            {{- if .Values.metrics.remoteWrite.enabled }}
+              {{- $exporters = append $exporters "prometheusremotewrite" }}
+            {{- end }}
+            {{- if .Values.metrics.otlp.enabled }}
+              {{- $exporters = append $exporters "otlphttp/metrics" }}
+            {{- end }}
+            {{- $exporters | join ", " -}}
+          ]
+      telemetry:
+        logs:
+          level: "info"
+{{- end }}

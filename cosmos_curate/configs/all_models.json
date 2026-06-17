@@ -1,0 +1,221 @@
+{
+    "aesthetic_scorer": {
+        "model_id": "ttj/sac-logos-ava1-l14-linearMSE",
+        "version": "1e77fa05081323d99725fc40a9bf9f88180490e7",
+        "filelist": ["model.safetensors"],
+        "precision": "FP32",
+        "nvcf_model_id": "sac_logos_ava1_l14_linear_mse"
+    },
+    "bert": {
+        "model_id": "google-bert/bert-large-uncased",
+        "version": "6da4b6a26a1877e173fca3225479512db81a5e5b",
+        "filelist": [
+            "config.json",
+            "model.safetensors",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "vocab.txt"
+        ],
+        "precision": "FP32",
+        "nvcf_model_id": "bert_large_uncased"
+    },
+    "clip_vit": {
+        "model_id": "openai/clip-vit-large-patch14",
+        "version": "32bd64288804d66eefd0ccbe215aa642df71cc41",
+        "filelist": [
+            "config.json",
+            "merges.txt",
+            "model.safetensors",
+            "preprocessor_config.json",
+            "special_tokens_map.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "vocab.json"
+        ],
+        "precision": "FP32",
+        "nvcf_model_id": "clip_vit_large_patch14"
+    },
+    "cosmos_embed1_224p": {
+        "model_id": "nvidia/Cosmos-Embed1-224p",
+        "version": "85f56274be7ce439175b4587fa6e3525556d4832",
+        "filelist": null,
+        "precision": "BF16",
+        "nvcf_model_id": "cosmos_embed1_224p"
+    },
+    "cosmos_embed1_336p": {
+        "model_id": "nvidia/Cosmos-Embed1-336p",
+        "version": "5d8309dd5c9ec8f856b16d589693004c907c9a57",
+        "filelist": null,
+        "precision": "BF16",
+        "nvcf_model_id": "cosmos_embed1_336p"
+    },
+    "cosmos_embed1_448p": {
+        "model_id": "nvidia/Cosmos-Embed1-448p",
+        "version": "9f4ff4d8d3df0968276b2191806344000d6752a9",
+        "filelist": null,
+        "precision": "BF16",
+        "nvcf_model_id": "cosmos_embed1_448p"
+    },
+    "cosmos_reason1": {
+        "model_id": "nvidia/Cosmos-Reason1-7B",
+        "version": "0caf724f837efea5e25bf6d5818dcdeec0a36604",
+        "filelist": null,
+        "precision": "BF16",
+        "nvcf_model_id": "cosmos_reason1_7b"
+    },
+    "cosmos_reason2": {
+        "model_id": "nvidia/Cosmos-Reason2-8B",
+        "version": "b9806227bdb6f9dce8d0fb9d832718dd8b5efdf5",
+        "filelist": null,
+        "precision": "BF16",
+        "nvcf_model_id": "cosmos_reason2_8b"
+    },
+    "gpt2": {
+        "model_id": "openai-community/gpt2",
+        "version": "607a30d783dfa663caf39e06633721c8d4cfcd7e",
+        "filelist": null,
+        "precision": "FP32",
+        "nvcf_model_id": "gpt2"
+    },
+    "gpt_oss_20b": {
+        "model_id": "openai/gpt-oss-20b",
+        "version": "6cee5e81ee83917806bbde320786a8fb61efebee",
+        "filelist": [
+            "chat_template.jinja",
+            "config.json",
+            "generation_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "model.safetensors.index.json",
+            "model-00000-of-00002.safetensors",
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors"
+        ],
+        "precision": "BF16",
+        "nvcf_model_id": "gpt_oss_20b"
+    },
+    "internvideo2_mm": {
+        "model_id": "OpenGVLab/InternVideo2-Stage2_1B-224p-f4",
+        "version": "4362e1f88a992e7edbfd7696f7f78b7f79426dfd",
+        "filelist": ["InternVideo2-stage2_1b-224p-f4.pt"],
+        "precision": "BF16",
+        "nvcf_model_id": "internvideo2_stage2_1b_224p_f4"
+    },
+    "nemotron": {
+        "model_id": "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16",
+        "version": "5f7b7fac031d1eb7b8b8f2266c305b3f2fcc6ff4",
+        "filelist": null,
+        "precision": "BF16",
+        "nvcf_model_id": "nemotron_nano_12b_v2_vl_bf16"
+    },
+    "qwen2.5_lm": {
+        "model_id": "Qwen/Qwen2.5-14B-Instruct",
+        "version": "cf98f3b3bbb457ad9e2bb7baf9a0125b6b88caa8",
+        "filelist": null,
+        "precision": "BF16",
+        "nvcf_model_id": "qwen2_5_14b_instruct"
+    },
+    "qwen2.5_vl": {
+        "model_id": "Qwen/Qwen2.5-VL-7B-Instruct",
+        "version": "cc594898137f460bfe9f0759e9844b3ce807cfb5",
+        "filelist": null,
+        "precision": "BF16",
+        "nvcf_model_id": "qwen2_5_vl_7b_instruct"
+    },
+    "qwen3_vl_30b": {
+        "model_id": "Qwen/Qwen3-VL-30B-A3B-Instruct",
+        "version": "4b184fbdab8886057d8d80c09f35bcfc65fe640e",
+        "filelist": null,
+        "precision": "BF16",
+        "nvcf_model_id": "qwen3_vl_30b_a3b_instruct"
+    },
+    "qwen3_vl_30b_fp8": {
+        "model_id": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+        "version": "d9748a51ae66354c4dad665aab2c71f26cf2c8cd",
+        "filelist": null,
+        "precision": "FP8",
+        "nvcf_model_id": "qwen3_vl_30b_a3b_instruct_fp8"
+    },
+    "qwen3_vl_235b": {
+        "model_id": "Qwen/Qwen3-VL-235B-A22B-Instruct",
+        "version": "326b2e35ea25798d32df16d16d0dba461959e931",
+        "filelist": null,
+        "precision": "BF16",
+        "nvcf_model_id": "qwen3_vl_235b_a22b_instruct"
+    },
+    "qwen3_vl_235b_fp8": {
+        "model_id": "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8",
+        "version": "7fbcd8c9e2ad011808ed8a57d64c462605c3e381",
+        "filelist": null,
+        "precision": "FP8",
+        "nvcf_model_id": "qwen3_vl_235b_a22b_instruct_fp8"
+    },
+    "qwen3_5_27b": {
+        "model_id": "Qwen/Qwen3.5-27B-FP8",
+        "version": "97f5941bf617e31c5e237364a8602ce3f03a551a",
+        "filelist": null,
+        "precision": "FP8",
+        "nvcf_model_id": "qwen3_5_27b"
+    },
+    "seedvr2_3b": {
+        "model_id": "ByteDance-Seed/SeedVR2-3B",
+        "version": "37255ff8cccfb01071b87f635a5948ca8d53117c",
+        "filelist": null,
+        "precision": "BF16",
+        "nvcf_model_id": "seedvr2_3b"
+    },
+    "seedvr2_7b": {
+        "model_id": "ByteDance-Seed/SeedVR2-7B",
+        "version": "eb0c4281d41ba3767d4f14370f0e37e9e9180c16",
+        "filelist": null,
+        "precision": "BF16",
+        "nvcf_model_id": "seedvr2_7b"
+    },
+    "seedvr2_7b_sharp": {
+        "model_id": "ByteDance-Seed/SeedVR2-7B",
+        "version": "eb0c4281d41ba3767d4f14370f0e37e9e9180c16",
+        "filelist": null,
+        "precision": "BF16",
+        "nvcf_model_id": "seedvr2_7b_sharp"
+    },
+    "t5_xxl": {
+        "model_id": "google-t5/t5-11b",
+        "version": "90f37703b3334dfe9d2b009bfcbfbf1ac9d28ea3",
+        "filelist": [
+            "config.json",
+            "pytorch_model.bin",
+            "tokenizer.json",
+            "spiece.model"
+        ],
+        "precision": "FP32",
+        "nvcf_model_id": "t5_efficient_xxl_11b_encoder"
+    },
+    "transnetv2": {
+        "model_id": "Sn4kehead/TransNetV2",
+        "version": "db6ceabeb692ec71ecc6beb6d00db67ad1412d7f",
+        "filelist": null,
+        "precision": "FP32",
+        "nvcf_model_id": "sn4kehead_transnetv2"
+    },
+    "paddle_ocr_det": {
+        "model_id": "PaddlePaddle/PP-OCRv4_mobile_det",
+        "version": "3cc09f3a5b424e8e010abc7a4271aea12999c2f7",
+        "filelist": null,
+        "precision": "FP32",
+        "nvcf_model_id": "paddle_ocr_det"
+    },
+    "paddle_ocr_rec": {
+        "model_id": "PaddlePaddle/PP-OCRv4_mobile_rec",
+        "version": "a2deb05cb05813be2da3365672881aa496d1452b",
+        "filelist": null,
+        "precision": "FP32",
+        "nvcf_model_id": "paddle_ocr_rec"
+    },
+    "sam3": {
+        "model_id": "facebook/sam3",
+        "version": "3c879f39826c281e95690f02c7821c4de09afae7",
+        "filelist": null,
+        "precision": "BF16"
+    }
+}

@@ -1,0 +1,7 @@
+cosmos_curate/client
+cosmos_curate/examples
+tests/cosmos_curate/client
+
+.git
+.pixi
+build

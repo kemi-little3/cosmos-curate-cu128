@@ -1,0 +1,924 @@
+workflow:
+  rules:
+    # Run pipeline for merge requests
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # Run pipeline for merged commits to protected branches
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_PROTECTED == "true"'
+    # Run pipeline for scheduled pipelines (cron)
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    # Run pipeline for E2E testing
+    - if: $TEST_END_TO_END == "True"
+    # Run manual pipeline for web-triggered runs
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    # Skip everything else
+    - when: never
+  auto_cancel:
+    on_new_commit: interruptible
+
+default:
+  tags:
+    - vm-builder  # Default to shell executor
+  before_script:
+    - set -x
+  interruptible: true
+
+variables:
+  # Versions
+  PYTHON_VERSION: "3.12.13"
+
+  # GitLab Runner feature flags
+  FF_USE_FASTZIP: "true"
+
+  # Git config
+  GIT_STRATEGY: fetch
+  GIT_DEPTH: 1
+  GIT_SUBMODULE_STRATEGY: normal
+  GIT_SUBMODULE_DEPTH: 1
+
+  # GitLab container registry
+  CURATOR_IMAGE: ${CI_REGISTRY_IMAGE}/curator
+  CURATOR_SLIM_IMAGE: ${CI_REGISTRY_IMAGE}/curator-slim
+  CI_BUILDER_IMAGE_REPO: ${CI_REGISTRY_IMAGE}/ci-builder
+  CI_BUILDER_IMAGE: ${CI_BUILDER_IMAGE_REPO}:latest
+  BUILDX_BUILDER_NAME: ci-cosmos-builder
+
+  # Pytest configuration
+  PYTEST_XDIST_WORKERS: 4
+
+  NGC_NVCF_ORG: "$NVCF_ORG_ID"  # Fallback to PERF_NGC_NVCF_ORG_ID if needed manually
+  # This happens later in the login script, after the value secrets are sourced
+  # NGC_NVCF_API_KEY: "$PERF_NGC_NVCF_API_KEY"  # override of $NVCF_KEY if needed
+
+  # GPU type/instance/cluster info
+  NVCF_GPU_TYPE:
+    description: "GPU type for NVCF testing (e.g., L40S, H100)"
+    value: "H100"
+  NVCF_INSTANCE_TYPE:
+    description: "Instance type for NVCF testing (e.g., OCI.GPU.L40S_1x, OCI.GPU.H100_1x)"
+    value: "OCI.GPU.H100_1x"
+  NVCF_CUSTOM_BACKEND:
+    description: "Custom NVCF backend for testing (overrides default GitLab CI/CD variable)"
+    value: "$NVCF_BACKEND"  # instead of $PERF_NVCF_BACKEND
+
+  # Image names
+  NVCF_DEV_BASE_IMAGE: "dev-cosmos-curator"  # Base name for NVCF dev images
+  NVCF_DEV_IMAGE: "nvcr.io/${NGC_NVCF_ORG}/${NVCF_DEV_BASE_IMAGE}"  # Complete NVCF dev image path
+  NVCF_STAGING_BASE_IMAGE: "staging-cosmos-curator"  # Base name for NVCF staging images
+  NVCF_STAGING_IMAGE: "nvcr.io/${NGC_NVCF_ORG}/${NVCF_STAGING_BASE_IMAGE}"  # Complete NVCF staging image path
+  NVCF_PROD_BASE_IMAGE: "prod-cosmos-curator"  # Base name for NVCF prod images
+  NVCF_PROD_IMAGE: "nvcr.io/${NGC_NVCF_ORG}/${NVCF_PROD_BASE_IMAGE}"  # Complete NVCF prod image path
+
+  # AWS configuration
+  AWS_DEFAULT_REGION: "$AWS_DEFAULT_REGION"
+  S3_INPUT_VIDEO_PATH: "s3://${AWS_S3_BUCKET_NAME}/cicd-curator-oss/raw_videos/samples"
+  S3_OUTPUT_PATH: "s3://${AWS_S3_BUCKET_NAME}/cicd-curator-oss/output/${CI_PIPELINE_ID}"
+  S3_OUTPUT_CLIP_PATH: "${S3_OUTPUT_PATH}/cosmos-curator-nvcf-helm/raw_clips"
+  S3_OUTPUT_DEDUP_PATH: "${S3_OUTPUT_PATH}/cosmos-curator-nvcf-helm/dedup_results"
+  S3_OUTPUT_DATASET_PATH: "${S3_OUTPUT_PATH}/cosmos-curator-nvcf-helm/datasets"
+
+  # HELM configuration
+  NVCF_MAX_CONCURRENCY: 2
+  NVCF_INSTANCE_COUNT: 1
+  HELM_THANOS_RECEIVER_URL: "$HELM_THANOS_RECEIVER_URL"
+  HELM_BYO_METRICS_RECEIVER_CLIENT_CRT: $HELM_BYO_METRICS_RECEIVER_CLIENT_CRT
+  HELM_BYO_METRICS_RECEIVER_CLIENT_KEY: $HELM_BYO_METRICS_RECEIVER_CLIENT_KEY
+  HELM_GPU_REQUESTS: 1
+  HELM_GPU_LIMITS: 1
+  HELM_SHMEM_LIMIT: 500Gi
+  HELM_IMAGE_TAG:
+  TEST_END_TO_END:
+    description: "Run cosmos-curator end-to-end test pipeline"
+    value: "False"
+    options:
+      - "True"
+      - "False"
+  REFRESH_CI_BUILDER_IMAGE:
+    description: "Build and push ci-builder image for Docker-runner jobs"
+    value: "False"
+    options:
+      - "True"
+      - "False"
+  RUN_PROMOTE_TO_PROD:
+    description: "Allow scheduled promote_to_prod job to run"
+    value: "True"
+    options:
+      - "True"
+      - "False"
+  RUN_BENCHMARK:
+    description: "Scheduled nvcf_split_benchmark (same STAGING_TAG dotenv as promote; skopeo dev→perf then NVCF on perf)"
+    value: "False"
+    options:
+      - "True"
+      - "False"
+  HELM_DEBUG_KEEP_FAILED_DEPLOYMENTS:
+    description: "On failure, do not delete the deployment"
+    value: "False"
+    options:
+      - "True"
+      - "False"
+  CICD_HELM_CHART_NAME:
+    description: "Helm chart name for the CICD pipeline"
+    value: "cosmos-curate"
+  CICD_HELM_CHART_VERSION:
+    description: "Helm chart version for the CICD pipeline"
+    value: "2.2.2"
+  XENNA_REF:
+    description: "cosmos-xenna git ref (branch/tag/SHA) to build when the 'use-local-xenna-build' MR label is set"
+    value: "main"
+
+  # Vault integration
+  VAULT_ADDR: "$VAULT_ADDR"
+  VAULT_NAMESPACE: "$VAULT_NAMESPACE"
+  VAULT_ROLE: "$VAULT_ROLE"
+  VAULT_MOUNT_PATH: "$VAULT_MOUNT_PATH"
+
+  # Perf benchmark configuration
+  PERF_NGC_NVCF_ORG_ID: "$PERF_NGC_NVCF_ORG_ID"
+  PERF_NVCF_FUNC_ID: "$PERF_NVCF_FUNC_ID"
+  PERF_NVCF_FUNC_VERSION: "$PERF_NVCF_FUNC_VERSION"
+  PERF_NVCF_METRICS_ENDPOINT: "$PERF_NVCF_METRICS_ENDPOINT"
+  PERF_NVCF_BACKEND: "$PERF_NVCF_BACKEND"
+  PERF_NVCF_GPU: "$PERF_NVCF_GPU"
+  PERF_NVCF_INSTANCE_TYPE: "$PERF_NVCF_INSTANCE_TYPE"
+  PERF_S3_ROOT_DIR: "$PERF_S3_ROOT_DIR"
+  PERF_S3_INPUT_DIR: "$PERF_S3_INPUT_DIR"
+  PERF_KRATOS_METRICS_ENDPOINT: "$PERF_KRATOS_METRICS_ENDPOINT"
+  PERF_KRATOS_BEARER_URL: "$PERF_KRATOS_BEARER_URL"
+  STAGING_TAG_OVERRIDE:
+
+stages:
+  - lint
+  - test
+  - build
+  - end-to-end
+  - post-merge
+
+# Reusable snippets (anchors)
+.snippets:
+  # Rules for pre-merge jobs
+  pre_merge_rules: &pre_merge_rules
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $TEST_END_TO_END == "True"'
+    - when: never
+
+  # Rules for post-merge jobs (promotion to staging/prod - main branch only)
+  # Note: Intentionally uses $CI_DEFAULT_BRANCH, not $CI_COMMIT_REF_PROTECTED
+  post_merge_rules: &post_merge_rules
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - when: never
+
+  # Rules for merge result pipelines only
+  merge_result_rules: &merge_result_rules
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"'
+    - when: never
+
+  # Rules for merge result pipelines and web triggers
+  merge_result_and_web_rules: &merge_result_and_web_rules
+    # MR pipelines (excluding merge trains)
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train" && $NVCF_HELM_STRICT == "true"'
+      when: on_success
+      allow_failure: false
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"'
+      when: on_success
+      allow_failure: true
+
+    # Web-triggered pipelines
+    - if: '$CI_PIPELINE_SOURCE == "web" && $NVCF_HELM_STRICT == "true"'
+      when: on_success
+      allow_failure: false
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: on_success
+      allow_failure: true
+
+    # Default: skip if none of the above match
+    - when: never
+
+  # Rules for jobs that should run both before and after merging
+  # Post-merge runs on any protected branch
+  pre_post_merge_rules: &pre_post_merge_rules
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $TEST_END_TO_END == "True"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+
+  # Rules for jobs that should run on pre/post merge AND web triggers
+  # Post-merge runs on any protected branch
+  pre_post_merge_and_web_rules: &pre_post_merge_and_web_rules
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $TEST_END_TO_END == "True"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_PROTECTED == "true"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - when: never
+
+  # Rules for scheduled promote/package jobs
+  schedule_rules_promote: &schedule_rules_promote
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $RUN_PROMOTE_TO_PROD == "True"'
+    - when: never
+
+  # Rules for ci-builder image refresh jobs
+  ci_builder_refresh_rules: &ci_builder_refresh_rules
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $REFRESH_CI_BUILDER_IMAGE == "True"'
+    - if: '$CI_PIPELINE_SOURCE == "web" && $REFRESH_CI_BUILDER_IMAGE == "True"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+    - when: never
+
+  # Compute IMAGE_TAG from target branch (MR) or commit branch (push/web)
+  # nvidia/main → main_2025-01-01_abc1234, nvidia/internal → internal_2025-01-01_abc1234
+  compute_image_tag: &compute_image_tag |
+    if [ -n "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}" ]; then
+      BRANCH_PREFIX="${CI_MERGE_REQUEST_TARGET_BRANCH_NAME##*/}"
+    else
+      BRANCH_PREFIX="${CI_COMMIT_BRANCH##*/}"
+    fi
+    IMAGE_TAG="${BRANCH_PREFIX}_${CI_COMMIT_TIMESTAMP%%T*}_${CI_COMMIT_SHORT_SHA}"
+    echo "Image tag: ${IMAGE_TAG}"
+
+  # Set up persistent buildx builder (see .gitlab/scripts/common.sh for details).
+  # Must run AFTER docker_login so the builder can reach the registry.
+  setup_buildx_builder: &setup_buildx_builder |
+    source .gitlab/scripts/common.sh
+    setup_buildx_builder "${BUILDX_BUILDER_NAME}"
+
+  # Configure Docker authentication for GitLab/NVCF registries
+  docker_login: &docker_login |
+    export DOCKER_CONFIG="${CI_PROJECT_DIR}/.docker"
+    mkdir -p "${DOCKER_CONFIG}"
+    docker login -u gitlab-ci-token -p ${CI_JOB_TOKEN} "${CI_REGISTRY}"
+    echo "$NGC_REGISTRY_KEY" | docker login nvcr.io/${NVCF_ORG_ID} --username '$oauthtoken' --password-stdin
+
+  # Last one in wins when using the same host/port, need perf in a dedicated anchor
+  docker_login_perf: &docker_login_perf |
+    export DOCKER_CONFIG="${CI_PROJECT_DIR}/.docker"
+    mkdir -p "${DOCKER_CONFIG}"
+    docker login -u gitlab-ci-token -p ${CI_JOB_TOKEN} "${CI_REGISTRY}"
+    echo "$PERF_REGISTRY_KEY" | docker login nvcr.io/${PERF_NGC_NVCF_ORG_ID} --username '$oauthtoken' --password-stdin
+
+  # Set up micromamba environment for Python dependencies
+  setup_micromamba: &setup_micromamba |
+    # We now use locally installed micromamba
+    # Shell runner: /usr/local/bin/micromamba
+    # Docker runner: /usr/bin/micromamba (if using the micromamba Docker image)
+    # Configure micromamba environment
+    export MAMBA_ROOT_PREFIX="$(pwd)/micromamba"
+    eval "$(micromamba shell hook -s posix)"
+    # Create Python environment for curator
+    micromamba create -n curator python=${PYTHON_VERSION} poetry -y
+    micromamba activate curator
+
+  # Activate the prebuilt curator environment from ci-builder image
+  setup_ci_builder_env: &setup_ci_builder_env |
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    eval "$(micromamba shell hook -s posix)"
+    micromamba activate curator
+
+  # Activate an existing micromamba environment
+  activate_micromamba: &activate_micromamba |
+    # Configure micromamba environment
+    export MAMBA_ROOT_PREFIX="$(pwd)/micromamba"
+    eval "$(micromamba shell hook -s posix)"
+    # Create Python environment for curator
+    micromamba activate curator
+
+  # Clean up micromamba environment
+  teardown_micromamba: &teardown_micromamba |
+    micromamba deactivate || true
+    micromamba env remove -n curator -y || true
+
+  # Install curator full requirements
+  setup_curator: &setup_curator |
+    poetry install --extras=local --no-interaction
+
+  # Install curator CLI requirements
+  setup_curator_cli: &setup_curator_cli |
+    poetry install --no-interaction
+
+  # Configure cosmos-curate nvcf CLI
+  configure_nvcf_cli: &configure_nvcf_cli |
+    cosmos-curate nvcf config set --org $NGC_NVCF_ORG --key $NVCF_KEY
+
+ruff:
+  stage: lint
+  image: ${CI_BUILDER_IMAGE}
+  tags:
+    - build-runner  # Override to Docker executor
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  rules: *pre_merge_rules
+  script:
+    - *setup_ci_builder_env
+    - ruff format --check
+    - ruff check
+
+mypy:
+  stage: lint
+  image: ${CI_BUILDER_IMAGE}
+  tags:
+    - build-runner  # Override to Docker executor
+  rules: *pre_merge_rules
+  script:
+    - *setup_ci_builder_env
+    - *setup_curator
+    - mypy --pretty
+  retry:
+    max: 2
+    when: always
+
+unit_tests:
+  stage: test
+  needs: []
+  variables:
+    PYTEST_ADDOPTS: >-
+      --junitxml=report.xml
+      --cov=cosmos_curate
+      --cov-report=term
+      --cov-report=xml:unit-coverage.xml
+      --cov-report=html:unit-htmlcov
+  rules: *pre_post_merge_rules
+  script:
+    - *setup_micromamba
+    - *setup_curator
+    - pytest -s
+    # Save the raw coverage data file
+    - cp .coverage .coverage.unit_tests || true
+    - *teardown_micromamba
+  artifacts:
+    when: always
+    reports:
+      junit: report.xml
+    paths:
+      - unit-htmlcov/
+      - unit-coverage.xml
+      - .coverage.unit_tests
+    expire_in: 1 week
+  retry:
+    max: 2
+    when: always
+
+.build_curator_arch:
+  stage: build
+  parallel:
+    matrix:
+      - PLATFORM: amd64
+        RUNNER_TAG: vm-builder
+      - PLATFORM: arm64
+        RUNNER_TAG: vm-builder-arm64
+  tags:
+    - ${RUNNER_TAG}
+  rules: *pre_post_merge_and_web_rules
+  id_tokens:
+    VAULT_JWT_TOKEN:
+      aud: ${VAULT_ADDR}
+  before_script:
+    - source .gitlab/vault/vault-auth.sh
+  script:
+    - *compute_image_tag
+    # For web triggers, this is a no-op since we use existing images
+    - |
+      if [[ "$CI_PIPELINE_SOURCE" == "web" ]]; then
+        echo "Web trigger detected - skipping image build, using existing images"
+        exit 0
+      fi
+    # Set up environment
+    - *docker_login
+    - *setup_buildx_builder
+    - *setup_micromamba
+    - *setup_curator_cli
+    - source .gitlab/scripts/common.sh
+    - get_cache_refs "${BUILD_IMAGE_REPO}" "${PLATFORM}"
+    # When the MR carries the 'use-local-xenna-build' label, build a
+    # cosmos-xenna wheel from XENNA_REF (default: main) and let the image
+    # build consume it via --use-local-xenna-build. The slim build is
+    # skipped because slim images install pixi envs at runtime from the
+    # lockfile, which still pins the PyPI-released cosmos-xenna.
+    - |
+      if [[ ",${CI_MERGE_REQUEST_LABELS:-}," == *",use-local-xenna-build,"* && "${BUILD_EXTRA_ARGS:-}" != *"--slim"* ]]; then
+        echo "MR label 'use-local-xenna-build' detected; building cosmos-xenna wheel from ref '${XENNA_REF:-main}'..."
+        bash .gitlab/scripts/build_xenna_wheel.sh
+        BUILD_EXTRA_ARGS="${BUILD_EXTRA_ARGS:-} --use-local-xenna-build"
+        echo "Will pass to cosmos-curate image build: ${BUILD_EXTRA_ARGS}"
+      fi
+    # Build and push in a single step (BuildKit pushes directly to registry)
+    - |
+      cosmos-curate image build \
+      ${BUILD_EXTRA_ARGS:-} \
+      --curator-path . \
+      --image-name ${BUILD_IMAGE_REPO} \
+      --image-tag ${IMAGE_TAG}-${PLATFORM} \
+      ${CACHE_FROM_ARGS} \
+      ${CACHE_TO_ARG} \
+      --push \
+      --no-load
+    - echo "Built and pushed ${BUILD_IMAGE_REPO}:${IMAGE_TAG}-${PLATFORM} from curator commit [${CI_COMMIT_SHA}]"
+    - *teardown_micromamba
+  retry:
+    max: 2
+    when: always
+
+build_deploy_curator_arch:
+  extends: .build_curator_arch
+  variables:
+    BUILD_IMAGE_REPO: ${CURATOR_IMAGE}
+
+build_deploy_curator_slim_arch:
+  extends: .build_curator_arch
+  variables:
+    BUILD_IMAGE_REPO: ${CURATOR_SLIM_IMAGE}
+    BUILD_EXTRA_ARGS: "--slim"
+
+build_ci_builder_image_arch:
+  stage: build
+  parallel:
+    matrix:
+      - PLATFORM: amd64
+        RUNNER_TAG: vm-builder
+      - PLATFORM: arm64
+        RUNNER_TAG: vm-builder-arm64
+  tags:
+    - ${RUNNER_TAG}
+  rules: *ci_builder_refresh_rules
+  script:
+    - export DOCKER_CONFIG="${CI_PROJECT_DIR}/.docker"
+    - mkdir -p "${DOCKER_CONFIG}"
+    - docker login -u gitlab-ci-token -p "${CI_JOB_TOKEN}" "${CI_REGISTRY}"
+    - CI_BUILDER_ARCH_IMAGE="${CI_BUILDER_IMAGE_REPO}:${CI_COMMIT_SHORT_SHA}-${PLATFORM}"
+    - docker build -f Dockerfile.ci -t "${CI_BUILDER_ARCH_IMAGE}" .
+    - docker push "${CI_BUILDER_ARCH_IMAGE}"
+    - echo "Pushed ${CI_BUILDER_ARCH_IMAGE}"
+  retry:
+    max: 2
+    when: always
+
+build_ci_builder_image:
+  stage: build
+  tags:
+    - vm-builder
+  needs:
+    - build_ci_builder_image_arch
+  rules: *ci_builder_refresh_rules
+  script:
+    - export DOCKER_CONFIG="${CI_PROJECT_DIR}/.docker"
+    - mkdir -p "${DOCKER_CONFIG}"
+    - docker login -u gitlab-ci-token -p "${CI_JOB_TOKEN}" "${CI_REGISTRY}"
+    - *setup_buildx_builder
+    - CI_BUILDER_IMAGE_SHA="${CI_BUILDER_IMAGE_REPO}:${CI_COMMIT_SHORT_SHA}"
+    - CI_BUILDER_AMD64_IMAGE="${CI_BUILDER_IMAGE_REPO}:${CI_COMMIT_SHORT_SHA}-amd64"
+    - CI_BUILDER_ARM64_IMAGE="${CI_BUILDER_IMAGE_REPO}:${CI_COMMIT_SHORT_SHA}-arm64"
+    - docker buildx imagetools create --builder "${BUILDX_BUILDER_NAME}" --tag "${CI_BUILDER_IMAGE_SHA}" "${CI_BUILDER_AMD64_IMAGE}" "${CI_BUILDER_ARM64_IMAGE}"
+    - docker buildx imagetools create --builder "${BUILDX_BUILDER_NAME}" --tag "${CI_BUILDER_IMAGE}" "${CI_BUILDER_AMD64_IMAGE}" "${CI_BUILDER_ARM64_IMAGE}"
+    - echo "Pushed multi-arch ${CI_BUILDER_IMAGE_SHA} and ${CI_BUILDER_IMAGE}"
+  retry:
+    max: 2
+    when: always
+
+.build_curator_manifest:
+  stage: build
+  rules: *pre_post_merge_and_web_rules
+  id_tokens:
+    VAULT_JWT_TOKEN:
+      aud: ${VAULT_ADDR}
+  before_script:
+    - source .gitlab/vault/vault-auth.sh
+  script:
+    - *compute_image_tag
+    - MANIFEST_IMAGE="${BUILD_IMAGE_REPO}:${IMAGE_TAG}"
+    # Export for downstream jobs via dotenv (when DOTENV_VAR_NAME is set)
+    - |
+      if [[ -n "${DOTENV_VAR_NAME:-}" ]]; then
+        echo "${DOTENV_VAR_NAME}=${MANIFEST_IMAGE}" >> build.env
+      fi
+    # For web triggers, this is a no-op since we use existing images
+    - |
+      if [[ "$CI_PIPELINE_SOURCE" == "web" ]]; then
+        echo "Web trigger detected - skipping manifest creation, using existing images"
+        exit 0
+      fi
+    # Enable Docker experimental features for manifest commands
+    - |
+      mkdir -p ~/.docker
+      if [ -f ~/.docker/config.json ]; then
+        jq '. + {"experimental":"enabled"}' ~/.docker/config.json > ~/.docker/config.json.tmp \
+          && mv ~/.docker/config.json.tmp ~/.docker/config.json
+      else
+        echo '{"experimental":"enabled"}' > ~/.docker/config.json
+      fi
+    - *docker_login
+    - *setup_buildx_builder
+    - AMD64_IMAGE="${BUILD_IMAGE_REPO}:${IMAGE_TAG}-amd64"
+    - ARM64_IMAGE="${BUILD_IMAGE_REPO}:${IMAGE_TAG}-arm64"
+    - docker buildx imagetools create --builder "${BUILDX_BUILDER_NAME}" --tag "${MANIFEST_IMAGE}" "${AMD64_IMAGE}" "${ARM64_IMAGE}"
+    - echo "Created multi-arch image ${MANIFEST_IMAGE} from curator commit [${CI_COMMIT_SHA}]"
+    # Copy to NVCF registry (when NVCF_PUSH_IMAGE is set)
+    - |
+      if [[ -n "${NVCF_PUSH_IMAGE:-}" ]]; then
+        NVCF_TAG="${NVCF_PUSH_IMAGE}:${IMAGE_TAG}"
+        docker buildx imagetools create --builder "${BUILDX_BUILDER_NAME}" -t "${NVCF_TAG}" "${AMD64_IMAGE}" "${ARM64_IMAGE}"
+        echo "Copied to image ${NVCF_TAG} from curator commit [${CI_COMMIT_SHA}]"
+      fi
+  retry:
+    max: 2
+    when: always
+
+build_deploy_curator:
+  extends: .build_curator_manifest
+  needs:
+    - build_deploy_curator_arch
+  variables:
+    BUILD_IMAGE_REPO: ${CURATOR_IMAGE}
+    DOTENV_VAR_NAME: CURATOR_FULL_IMAGE
+    NVCF_PUSH_IMAGE: ${NVCF_DEV_IMAGE}
+  artifacts:
+    reports:
+      dotenv: build.env
+
+build_deploy_curator_slim:
+  extends: .build_curator_manifest
+  needs:
+    - build_deploy_curator_slim_arch
+  variables:
+    BUILD_IMAGE_REPO: ${CURATOR_SLIM_IMAGE}
+    DOTENV_VAR_NAME: CURATOR_SLIM_FULL_IMAGE
+  artifacts:
+    reports:
+      dotenv: build.env
+
+# Run GPU tests on SLURM cluster
+gpu_tests:
+  stage: end-to-end
+  rules: *pre_post_merge_rules
+  needs: ["build_deploy_curator_slim"]
+  tags:
+    - ${SLURM_RUNNER_TAG}
+  variables:
+    CI_BUILDS_DIR: ${NEMO_CI_PATH}/.config/${CI_JOB_ID}
+    ENROOT_CONFIG_PATH: "${CI_BUILDS_DIR}/.enroot"
+  script:
+    # Set up Docker authentication
+    - mkdir -p "${ENROOT_CONFIG_PATH}"
+    - echo "machine ${CI_REGISTRY/:5005/} login gitlab-ci-token password ${CI_JOB_TOKEN}" > $ENROOT_CONFIG_PATH/.credentials
+
+    # Pull the specific slim image version to test
+    - *compute_image_tag
+    - FULL_IMAGE=${CURATOR_SLIM_IMAGE}:${IMAGE_TAG}
+    - BUILD_IMAGE_NAME_SBATCH="${FULL_IMAGE/:5005\///}"
+    # Submit SLURM job using the slim Docker image; mount pixi cache from
+    # Lustre so pixi install inside the container reads from cache (fast)
+    # but writes .pixi to local container storage (fast imports).
+    - DATA_DIR=/lustre/fsw/coreai_dlalgo_ci/datasets/nemo_curator/video
+    - MODEL_DIR=/lustre/fsw/coreai_dlalgo_ci/nemo_video_curator/models
+    - WORKSPACE_DIR=/lustre/fsw/coreai_dlalgo_ci/nemo_video_curator/default_workspace
+    - AWS_CREDS_PATH="/lustre/fsw/coreai_dlalgo_ci/datasets/nemo_curator/video/awscreds"
+    - PIXI_CACHE=/lustre/fsw/coreai_dlalgo_ci/nemo_video_curator/pixi/cache
+    - MOUNTS="${DATA_DIR}:/config/data,${MODEL_DIR}:/config/models,${WORKSPACE_DIR}:/config/default_workspace,${AWS_CREDS_PATH}:/dev/shm/s3_creds_file,${CI_PROJECT_DIR}:/config/project,${PIXI_CACHE}:/pixi-cache"
+    - NODES=1
+    - export LOCAL_DOCKER_ENV_VAR_NAME=1
+    - export PIXI_CACHE_DIR=/pixi-cache
+    - export CONDA_OVERRIDE_CUDA=13.0.2
+    # Run pytest for each environment; sleep 15 min before retry
+    - >
+      srun -A ${SLURM_ACCOUNT} \
+           -p ${SLURM_PARTITION} \
+           -N 1 \
+           --container-writable \
+           --container-image ${BUILD_IMAGE_NAME_SBATCH} \
+           --container-mounts ${MOUNTS} \
+           -J ${SLURM_ACCOUNT}-cosmos_curator_test.${CI_JOB_ID} \
+           -t "02:00:00" \
+           /config/project/.gitlab/scripts/run_env_tests.sh \
+      || (sleep 900 && false)
+  retry:
+    max: 2
+    when: always
+  artifacts:
+    when: always
+    reports:
+      junit:
+        - "*-report.xml"
+    paths:
+      - "*-coverage.xml"
+      - "*-htmlcov/"
+      - "*-report.xml"
+      - ".coverage.gpu_*"
+    expire_in: 1 week
+
+# Run end-to-end pipelines on SLURM cluster
+slurm_end_to_end:
+  stage: end-to-end
+  id_tokens:
+    VAULT_JWT_TOKEN:
+      aud: ${VAULT_ADDR}
+  needs: ["build_deploy_curator_slim"]
+  rules: *merge_result_and_web_rules
+  tags:
+    - ${SLURM_RUNNER_TAG}
+  variables:
+    CI_BUILDS_DIR: ${NEMO_CI_PATH}/.config/${CI_JOB_ID}
+    ENROOT_CONFIG_PATH: "${CI_BUILDS_DIR}/.enroot"
+    SLURM_E2E_S3_PROFILE_NAME: "default"
+  before_script:
+    # Install tools directly without micromamba (SLURM runner doesn't have it); use uv to pin Python
+    - source .gitlab/vault/vault-auth.sh
+    - export PATH="$HOME/.local/bin:${PATH}"
+    - curl -LsSf https://astral.sh/uv/install.sh | sh
+    - uv python install ${PYTHON_VERSION}
+    - uv venv --python ${PYTHON_VERSION} venv
+    - source venv/bin/activate
+    - pip install --upgrade pip
+    - pip install poetry awscli
+    - poetry install --no-interaction  # Install cosmos-curate CLI
+  script:
+    - source venv/bin/activate
+    - .gitlab/scripts/slurm_end_to_end.sh
+  after_script:
+    - rm -rf venv || true
+  retry:
+    max: 2
+    when: always
+  artifacts:
+    when: always
+    paths:
+      - slurm_logs/
+      - slurm_remote_files/
+      - slurm_submit.log
+
+# Combine coverage from unit tests and GPU tests
+# This job runs after both unit_tests and gpu_tests complete, combining coverage data from:
+# - unit_tests: .coverage.unit_tests
+# - gpu_tests: .coverage.gpu_*
+# This provides a complete picture of test coverage across all test suites and environments.
+# The coverage badge and MR coverage stats will use data from this job.
+combine_coverage:
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  stage: end-to-end
+  needs: ["unit_tests", "gpu_tests"]
+  rules: *pre_post_merge_rules
+  image: ${CI_BUILDER_IMAGE}
+  tags:
+    - build-runner  # Override to Docker executor
+  script:
+    - *setup_ci_builder_env
+    # Combine coverage data from both jobs
+    - echo "Combining coverage from unit_tests and gpu_tests..."
+    - echo "Available coverage files:"
+    - ls -la .coverage.* || true
+    - coverage combine .coverage.unit_tests .coverage.gpu_*
+    # Generate final combined reports
+    - coverage report
+    - coverage xml
+    - coverage html
+  coverage: '/^TOTAL.*\s+(\d+\.\d+%)/'
+  artifacts:
+    when: always
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    paths:
+      - coverage.xml
+      - htmlcov/
+    expire_in: 1 week
+
+# SAST jobs
+include:
+  - template: Jobs/SAST.gitlab-ci.yml
+
+semgrep-sast:
+  needs: []
+  tags:
+    - build-runner  # Override to Docker executor
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+    SAST_EXCLUDED_PATHS: "cosmos-xenna/**"
+  rules: *pre_merge_rules
+
+# Run end-to-end tests on NVCF cluster
+nvcf-helm:
+  stage: end-to-end
+  needs: ["build_deploy_curator"]
+  rules: *merge_result_and_web_rules
+  image: ${CI_BUILDER_IMAGE}
+  tags:
+    - build-runner  # Override to Docker executor
+  variables:
+    HELM_FUNCTION_NAME: "cosmos-curator-${CI_JOB_NAME_SLUG}-${CI_PIPELINE_ID}"
+  id_tokens:
+    VAULT_JWT_TOKEN:
+      aud: ${VAULT_ADDR}
+  before_script:
+    - source .gitlab/vault/vault-auth.sh
+    - *setup_ci_builder_env
+    - *setup_curator_cli
+    - export HELM_BYO_METRICS_RECEIVER_CLIENT_CRT=$(echo $HELM_BYO_METRICS_RECEIVER_CLIENT_CRT_BASE64 | base64 -d | awk '{printf "%s\\n", $0}')
+    - export HELM_BYO_METRICS_RECEIVER_CLIENT_KEY=$(echo $HELM_BYO_METRICS_RECEIVER_CLIENT_KEY_BASE64 | base64 -d | awk '{printf "%s\\n", $0}')
+  script:
+    - *configure_nvcf_cli
+    - .gitlab/scripts/nvcf_helm_deploy.sh
+  after_script:
+    - *setup_ci_builder_env
+    - *setup_curator_cli
+    - *configure_nvcf_cli
+    - .gitlab/scripts/nvcf_helm_cleanup.sh
+  retry:
+    max: 2
+    when: always
+  artifacts:
+    when: always
+    paths:
+      - "invoke_split1.json"
+      - "invoke_split2.json"
+      - "invoke_dedup.json"
+      - "invoke_shard.json"
+      - "trace.log"
+      - "/tmp/*.log"
+
+# Run validation tests against S3 artifacts from NVCF function
+nvcf-helm-validate:
+  stage: end-to-end
+  needs: [ "nvcf-helm" ]
+  rules: *merge_result_and_web_rules
+  image: ${CI_BUILDER_IMAGE}
+  tags:
+    - build-runner  # Override to Docker executor
+  variables:
+    S3_FILE_SPLIT_SUMMARY: "${S3_OUTPUT_CLIP_PATH}/summary.json"
+    S3_FILE_DEDUP_SUMMARY: "${S3_OUTPUT_DEDUP_PATH}/extraction/dedup_summary_0.01.csv"
+    S3_FILE_SHARD_SUMMARY: "${S3_OUTPUT_DATASET_PATH}/v0/wdinfo_list.csv"
+  id_tokens:
+    VAULT_JWT_TOKEN:
+      aud: ${VAULT_ADDR}
+  before_script:
+    - *setup_ci_builder_env
+    - source .gitlab/vault/vault-auth.sh
+    - echo -n "$AWS_CONFIG_FILE_CONTENTS" | base64 -d > aws_credentials
+    - sed -i '/^endpoint/d' aws_credentials
+    - aws --version
+    - export AWS_SHARED_CREDENTIALS_FILE="$(pwd)/aws_credentials"
+  script:
+    - .gitlab/scripts/nvcf_helm_validate.sh
+
+promote_to_staging:
+  stage: post-merge
+  variables:
+    GIT_STRATEGY: none
+  rules: *post_merge_rules
+  id_tokens:
+    VAULT_JWT_TOKEN:
+      aud: ${VAULT_ADDR}
+  before_script:
+    - source .gitlab/vault/vault-auth.sh
+  script:
+    - *compute_image_tag
+    - echo "Promoting to staging from $IMAGE_TAG"
+    - *docker_login
+    - DEV="${NVCF_DEV_IMAGE}:${IMAGE_TAG}"
+    - STAGING="${NVCF_STAGING_IMAGE}:${IMAGE_TAG}"
+    - docker buildx imagetools create --tag "${STAGING}" "${DEV}"
+
+resolve_nvcf_staging_tag:
+  stage: test
+  image: ${CI_BUILDER_IMAGE}
+  tags:
+    - build-runner
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $RUN_PROMOTE_TO_PROD == "True"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $RUN_BENCHMARK == "True"'
+    - when: never
+  id_tokens:
+    VAULT_JWT_TOKEN:
+      aud: ${VAULT_ADDR}
+  before_script:
+    - source .gitlab/vault/vault-auth.sh
+    - *setup_ci_builder_env
+    - *setup_curator_cli
+  script:
+    - *configure_nvcf_cli
+    - bash .gitlab/scripts/resolve_nvcf_staging_tag.sh --write-dotenv staging_tag.env
+  artifacts:
+    reports:
+      dotenv: staging_tag.env
+
+# Promote the latest staging image to prod on a nightly schedule
+promote_to_prod:
+  stage: post-merge
+  rules: *schedule_rules_promote
+  needs:
+    - job: resolve_nvcf_staging_tag
+  id_tokens:
+    VAULT_JWT_TOKEN:
+      aud: ${VAULT_ADDR}
+  before_script:
+    - source .gitlab/vault/vault-auth.sh
+  script:
+    - echo "Promoting latest staging image to prod (STAGING_TAG=${STAGING_TAG})"
+    - *docker_login
+    - STAGING_IMAGE="${NVCF_STAGING_IMAGE}:${STAGING_TAG}"
+    - PROD_IMAGE="${NVCF_PROD_IMAGE}:${STAGING_TAG}"
+    - echo "Copying $STAGING_IMAGE -> $PROD_IMAGE"
+    - docker buildx imagetools create --tag "$PROD_IMAGE" "$STAGING_IMAGE"
+
+build-packages:
+  stage: post-merge
+  rules: *schedule_rules_promote
+  id_tokens:
+    VAULT_JWT_TOKEN:
+      aud: ${VAULT_ADDR}
+  before_script:
+    - source .gitlab/vault/vault-auth.sh
+    - *setup_micromamba
+    - TIMESTAMP=$(date -d ${CI_COMMIT_TIMESTAMP} +%s)
+    - VERSION=$(grep -m 1 'version = ' pyproject.toml | cut -d'"' -f2)
+    - PKG_VERSION="${VERSION}.dev${TIMESTAMP}"
+    - echo "Building package for ${PKG_VERSION}"
+    - pip install twine==6.1.0 --disable-pip-version-check
+    - poetry version "${PKG_VERSION}"
+    - poetry build --no-interaction
+  script:
+    - twine upload --skip-existing -u gitlab-ci-token -p ${CI_JOB_TOKEN} --repository-url
+      "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi" dist/*
+    - twine upload --skip-existing -u ${ARTIFACTORY_USER} -p ${ARTIFACTORY_TOKEN} --repository-url
+      "${ARTIFACTORY_URL}" dist/*
+
+nvcf_split_benchmark:
+  stage: test
+  timeout: 30h
+  interruptible: false  # keep running when main gets a new pipeline (auto_cancel.on_new_commit: interruptible)
+  image: ${CI_BUILDER_IMAGE}
+  tags:
+    - build-runner
+  needs:
+    - job: resolve_nvcf_staging_tag
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $RUN_BENCHMARK == "True"'
+    - when: never   # fallback: never run otherwise
+  id_tokens:
+    VAULT_JWT_TOKEN:
+      aud: ${VAULT_ADDR}
+  before_script:
+    - source .gitlab/vault/vault-auth.sh
+    - *setup_ci_builder_env
+    - *setup_curator_cli
+  script:
+    - .gitlab/scripts/nvcf_split_benchmark.sh
+
+# GPU tests - runs actual mini pipeline with GPU
+k8s_gpu_tests:
+  stage: end-to-end
+  tags:
+    - k8s-gpu
+  needs: ["build_deploy_curator_slim"]
+  image: ${CURATOR_SLIM_FULL_IMAGE}
+  timeout: 45 minutes
+  allow_failure: true
+  variables:
+    KUBERNETES_POLL_TIMEOUT: 1800
+  id_tokens:
+    VAULT_JWT_TOKEN:
+      aud: ${VAULT_ADDR}
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: on_success
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+    - when: never
+  before_script:
+    - source .gitlab/vault/vault-auth.sh
+    # Install pixi environments into /opt/cosmos-curate (where the slim
+    # image has the source + lockfile) so Ray workers find them.
+    - export PIXI_CACHE_DIR=/cache/pixi
+    - export CONDA_OVERRIDE_CUDA=13.0.2
+    - pushd /opt/cosmos-curate
+    - pixi install --frozen -e default -e unified -e legacy-transformers -e model-download
+    - popd
+  script:
+    - .gitlab/scripts/k8s_gpu_tests.sh
+  artifacts:
+    when: always
+    paths:
+      - "*-report.xml"
+      - "*-coverage.xml"
+    expire_in: 1 week
+
+# Helm chart deployment test on vanilla K8s
+k8s_helm_test:
+  stage: end-to-end
+  tags:
+    - k8s-cpu
+  needs: ["build_deploy_curator"]
+  image: ${CI_BUILDER_IMAGE}
+  timeout: 60 minutes
+  allow_failure: true
+  variables:
+    KUBERNETES_POLL_TIMEOUT: 1800
+  id_tokens:
+    VAULT_JWT_TOKEN:
+      aud: ${VAULT_ADDR}
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: on_success
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+    - when: never
+  before_script:
+    - source .gitlab/vault/vault-auth.sh
+  script:
+    - .gitlab/scripts/k8s_helm_test.sh
+  after_script:
+    - .gitlab/scripts/k8s_helm_cleanup.sh
