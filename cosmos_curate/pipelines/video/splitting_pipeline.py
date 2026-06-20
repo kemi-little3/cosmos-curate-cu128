@@ -24,6 +24,7 @@ Which:
 
 import argparse
 import math
+import os
 import pathlib
 import time
 from typing import Any, cast
@@ -974,7 +975,8 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
         )
 
     # --- T5 encoding (optional) ---
-    if args.generate_cosmos_predict_dataset != "disable":
+    generate_t5_embeddings = os.environ.get("GENERATE_T5_EMBEDDINGS", "1") != "0"
+    if args.generate_cosmos_predict_dataset != "disable" and generate_t5_embeddings:
         stages.extend(
             build_t5_stages(
                 T5Config(

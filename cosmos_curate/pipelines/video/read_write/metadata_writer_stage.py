@@ -17,6 +17,7 @@
 import base64
 import io
 import json
+import os
 import pathlib
 import pickle
 import uuid
@@ -1102,6 +1103,7 @@ class ClipWriterStage(CuratorStage):
     def _write_per_window_data(self, clip: Clip) -> None:
         if self._generate_cosmos_predict_dataset == "disable":
             return
+        generate_t5_embeddings = os.environ.get("GENERATE_T5_EMBEDDINGS", "1") != "0"
         for window in clip.windows:
             has_pose = (
                 window.pose_intrinsics is not None and window.pose_c2w is not None and window.pose_relative is not None
@@ -1126,7 +1128,7 @@ class ClipWriterStage(CuratorStage):
                     f"from {clip.source_video} has no caption, skip uploading to dataset",
                 )
                 continue
-            if len(window.t5_xxl_embedding) == 0:
+            if generate_t5_embeddings and len(window.t5_xxl_embedding) == 0:
                 logger.error(
                     f"Clip {clip.uuid} window [{window.start_frame}, {window.end_frame}] "
                     f"from {clip.source_video} has no T5 XXL embedding, skip uploading to dataset",
@@ -1160,22 +1162,23 @@ class ClipWriterStage(CuratorStage):
                 "dataset caption {clip.uuid} {window.start_frame}_{window.end_frame}",
                 clip.source_video,
             )
-            # upload T5 XXL embedding
-            dest_t5 = self._get_cosmos_predict_uri(
-                clip.uuid,
-                (window.start_frame, window.end_frame),
-                self._get_cosmos_predict_window_output_path(frame_count, "t5_xxl"),
-                "pickle",
-            )
-            buffer = io.BytesIO()
-            t5_embeddings = list(window.t5_xxl_embedding.values())
-            pickle.dump([t5_embeddings[0]], buffer)
-            self._write_data(
-                buffer.getvalue(),
-                dest_t5,
-                "dataset t5_xxl {clip.uuid} {window.start_frame}_{window.end_frame}",
-                clip.source_video,
-            )
+            if generate_t5_embeddings:
+                # upload T5 XXL embedding
+                dest_t5 = self._get_cosmos_predict_uri(
+                    clip.uuid,
+                    (window.start_frame, window.end_frame),
+                    self._get_cosmos_predict_window_output_path(frame_count, "t5_xxl"),
+                    "pickle",
+                )
+                buffer = io.BytesIO()
+                t5_embeddings = list(window.t5_xxl_embedding.values())
+                pickle.dump([t5_embeddings[0]], buffer)
+                self._write_data(
+                    buffer.getvalue(),
+                    dest_t5,
+                    "dataset t5_xxl {clip.uuid} {window.start_frame}_{window.end_frame}",
+                    clip.source_video,
+                )
             if self._vipe_pose_enabled:
                 self._write_per_window_pose_data(clip, window)
 
