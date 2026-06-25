@@ -80,9 +80,12 @@ def init_or_connect_to_cluster() -> None:
 
     tracing_hook = os.environ.get("XENNA_RAY_TRACING_HOOK")
     tracing_kwarg: dict[str, Any] = {"_tracing_startup_hook": tracing_hook} if tracing_hook else {}
+    ray_address = os.environ.get("RAY_ADDRESS")
+    address_kwarg: dict[str, Any] = {"address": ray_address} if ray_address else {}
     ray.init(
         ignore_reinit_error=True,
         log_to_driver=True,
+        **address_kwarg,
         **tracing_kwarg,
     )
 

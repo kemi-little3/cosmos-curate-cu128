@@ -41,3 +41,48 @@ def test_semantic_eval_preserves_text_contamination_audit_fields() -> None:
             "reason": "Quest text is overlaid on the scene.",
         }
     }
+
+
+def test_semantic_eval_accepts_bare_newline_in_reason_string() -> None:
+    """Qwen sometimes emits an unescaped newline before closing a JSON string."""
+    result = """{
+"post-production text": "yes",
+"text_type": "chat",
+"reason": "Chat messages and gameplay UI text are visible overlays.
+"
+}"""
+
+    _, _, per_window_reasons, per_window_errors, per_window_audit = evaluate_semantic_window_results(
+        [(0, result)],
+        filter_criteria=["post-production text"],
+        rejection_threshold=0.5,
+        score_only=True,
+    )
+
+    assert per_window_errors == {}
+    assert per_window_reasons == {0: {"post-production text": "yes"}}
+    assert per_window_audit == {
+        0: {
+            "text_type": "chat",
+            "reason": "Chat messages and gameplay UI text are visible overlays.\n",
+        }
+    }
+
+
+def test_semantic_eval_falls_back_when_reason_is_truncated() -> None:
+    """A truncated audit reason should not hide the completed rejection field."""
+    result = """{
+"post-production text": "yes",
+"text_type": "hud_ui",
+"reason": "The video displays a HUD with player scores and names."""
+
+    _, _, per_window_reasons, per_window_errors, per_window_audit = evaluate_semantic_window_results(
+        [(0, result)],
+        filter_criteria=["post-production text"],
+        rejection_threshold=0.5,
+        score_only=True,
+    )
+
+    assert per_window_errors == {}
+    assert per_window_reasons == {0: {"post-production text": "yes"}}
+    assert per_window_audit == {0: {"text_type": "hud_ui"}}

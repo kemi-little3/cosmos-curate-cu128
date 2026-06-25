@@ -147,6 +147,8 @@ cbor2 = ">=5.9" # CVE remediation: cbor2 5.9+ (unified env; fixes vs vulnerable 
 openai = ">=2.0.0"
 paddlepaddle = { version = "==3.2.*", index = "https://www.paddlepaddle.org.cn/packages/stable/cpu/"} # CPU-only; no CUDA runtime conflict with torch (unlike paddlepaddle-gpu)
 paddleocr = "==2.10.*"
+cvcuda-cu12 = { version = ">=0.16.0, <0.17", index = "https://pypi.nvidia.com/" }
+pynvvideocodec = { version = ">=2.1.0, <3", index = "https://pypi.nvidia.com/" }
 
 [feature.legacy-transformers.dependencies]
 einops = "*"

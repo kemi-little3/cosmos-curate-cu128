@@ -51,7 +51,61 @@ def custom_categories_union(type_allow: str | None, type_block: str | None) -> s
     return ",".join(sorted(categories)) if categories else None
 
 
-def _clean_json_string(output_text: str) -> dict[str, str] | None:
+def _escape_control_chars_in_json_strings(output_text: str) -> str:
+    """Escape bare control characters that appear inside JSON strings."""
+    chars: list[str] = []
+    in_string = False
+    escaped = False
+    for char in output_text:
+        if escaped:
+            chars.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            chars.append(char)
+            escaped = True
+            continue
+        if char == '"':
+            chars.append(char)
+            in_string = not in_string
+            continue
+        if in_string and char == "\n":
+            chars.append("\\n")
+            continue
+        if in_string and char == "\r":
+            chars.append("\\r")
+            continue
+        if in_string and char == "\t":
+            chars.append("\\t")
+            continue
+        chars.append(char)
+    return "".join(chars)
+
+
+def _extract_json_string_field(output_text: str, key: str) -> str | None:
+    """Extract a completed simple JSON string field from malformed model output."""
+    pattern = rf'"{re.escape(key)}"\s*:\s*"([^"\r\n]*)"'
+    match = re.search(pattern, output_text)
+    return match.group(1) if match else None
+
+
+def _fallback_parse_semantic_json(output_text: str) -> dict[str, str] | None:
+    """Recover filter-critical fields from truncated JSON-like output."""
+    post_production_text = _extract_json_string_field(output_text, "post-production text")
+    if post_production_text not in {"yes", "no"}:
+        return None
+
+    result = {"post-production text": post_production_text}
+    text_type = _extract_json_string_field(output_text, "text_type")
+    if text_type:
+        result["text_type"] = text_type
+    reason = _extract_json_string_field(output_text, "reason")
+    if reason:
+        result["reason"] = reason
+    return result
+
+
+def _clean_json_string(output_text: str, *, allow_fallback: bool = True) -> dict[str, str] | None:
     """Clean and fix common JSON formatting issues."""
     last_think_end = output_text.rfind("</think>")
     if last_think_end != -1:
@@ -80,20 +134,20 @@ def _clean_json_string(output_text: str) -> dict[str, str] | None:
                 break
     if end == -1:
         logger.error(f"Unmatched braces in output: {output_text!r}")
-        return None
+        return _fallback_parse_semantic_json(output_text) if allow_fallback else None
 
-    output_text = output_text[start : end + 1].strip()
+    output_text = _escape_control_chars_in_json_strings(output_text[start : end + 1].strip())
     try:
         return json.loads(output_text)  # type: ignore[no-any-return]
     except json.JSONDecodeError as e:
         logger.error(f"JSON Error: {e}")
         logger.error(f"Output text: {output_text}")
-        return None
+        return _fallback_parse_semantic_json(output_text) if allow_fallback else None
 
 
-def parse_results(caption: str) -> dict[str, str] | None:
+def parse_results(caption: str, *, allow_fallback: bool = True) -> dict[str, str] | None:
     """Parse a model caption into a normalized dictionary."""
-    result = _clean_json_string(caption)
+    result = _clean_json_string(caption, allow_fallback=allow_fallback)
     if result is None:
         return None
     return {k.replace(" ", "_"): v for k, v in result.items()}

@@ -2181,6 +2181,7 @@ environments:
       - pypi: https://mirrors.aliyun.com/pypi/packages/fb/76/641ae371508676492379f16e2fa48f4e2c11741bd63c48be4b12a6b09cba/aiosignal-1.4.0-py3-none-any.whl
       - pypi: https://mirrors.aliyun.com/pypi/packages/fd/55/b3b49a1b97aabcfbbd6c7326df9cb0b6fa0c0aefa8e89d500939e04aa229/opencv_python-4.13.0.92-cp37-abi3-manylinux_2_28_x86_64.whl
       - pypi: https://paddle-whl.bj.bcebos.com/stable/cpu/paddlepaddle/paddlepaddle-3.2.2-cp312-cp312-linux_x86_64.whl
+      - pypi: https://pypi.nvidia.com/cvcuda-cu12/cvcuda_cu12-0.16.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://pypi.nvidia.com/ngcsdk/ngcsdk-4.19.1-py3-none-any.whl
       - pypi: https://pypi.nvidia.com/nvidia-cublas-cu12/nvidia_cublas_cu12-12.8.4.1-py3-none-manylinux_2_27_x86_64.whl
       - pypi: https://pypi.nvidia.com/nvidia-cuda-cupti-cu12/nvidia_cuda_cupti_cu12-12.8.90-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
@@ -2197,6 +2198,7 @@ environments:
       - pypi: https://pypi.nvidia.com/nvidia-nvjitlink-cu12/nvidia_nvjitlink_cu12-12.8.93-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl
       - pypi: https://pypi.nvidia.com/nvidia-nvshmem-cu12/nvidia_nvshmem_cu12-3.4.5-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://pypi.nvidia.com/nvidia-nvtx-cu12/nvidia_nvtx_cu12-12.8.90-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+      - pypi: https://pypi.nvidia.com/pynvvideocodec/pynvvideocodec-2.1.0-cp312-cp312-manylinux_2_28_x86_64.whl
 packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
   build_number: 20
@@ -10199,6 +10201,17 @@ packages:
   - networkx
   - typing-extensions
   - safetensors>=0.6.0
+- pypi: https://pypi.nvidia.com/cvcuda-cu12/cvcuda_cu12-0.16.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+  name: cvcuda-cu12
+  version: 0.16.0
+  sha256: 4150f3920e6cd2e407b4ea0f9c78dcd791b7b06dc05b0a1e526633ff6201ecc3
+  index: https://pypi.nvidia.com/
+  requires_dist:
+  - numpy>=1.23.5
+  - pytest>=7.0 ; extra == 'dev'
+  - black>=22.0 ; extra == 'dev'
+  - flake8>=4.0 ; extra == 'dev'
+  requires_python: '>=3.9,<3.15'
 - pypi: https://pypi.nvidia.com/ngcsdk/ngcsdk-4.19.1-py3-none-any.whl
   name: ngcsdk
   version: 4.19.1
@@ -10330,3 +10343,9 @@ packages:
   sha256: 5b17e2001cc0d751a5bc2c6ec6d26ad95913324a4adb86788c944f8ce9ba441f
   index: https://pypi.nvidia.com/
   requires_python: '>=3'
+- pypi: https://pypi.nvidia.com/pynvvideocodec/pynvvideocodec-2.1.0-cp312-cp312-manylinux_2_28_x86_64.whl
+  name: pynvvideocodec
+  version: 2.1.0
+  sha256: c317fbad725b1b81936b863edcd98920bc4be423b9965719657030359d7afe29
+  index: https://pypi.nvidia.com/
+  requires_python: '>=3.8'

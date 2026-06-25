@@ -15,6 +15,7 @@
 
 """Tests for the OpenAI-compatible API caption stage."""
 
+import ast
 import asyncio
 import base64
 from pathlib import Path
@@ -552,6 +553,38 @@ def test_process_data_async_interleaving_preserves_window_ownership(monkeypatch:
     assert clip.errors["openai_caption_2"] == "boom"
 
 
+def test_process_data_logs_caption_timing_summary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """process_data should log aggregate timing buckets for caption work."""
+    stage = _make_stage(monkeypatch, batch_size=1)
+    _attach_openai_async_client(stage, AsyncMock(return_value=_FakeResponse([_FakeChoice("caption")])))
+
+    messages: list[str] = []
+    monkeypatch.setattr(openai_caption_stage, "logger", SimpleNamespace(info=lambda message: messages.append(message)))
+
+    task = _make_task(b"\x00\x01", num_windows=2)
+    try:
+        stage.process_data([task])
+    finally:
+        stage.destroy()
+
+    timing_messages = [message for message in messages if message.startswith("OpenAICaptionStage timing: ")]
+    assert len(timing_messages) == 1
+    timing = ast.literal_eval(timing_messages[0].split(": ", 1)[1])
+    assert timing["windows_count"] == 2
+    for name in (
+        "flatten_windows",
+        "semaphore_wait",
+        "mp4_resolve",
+        "base64_encode",
+        "request_build",
+        "api_call",
+        "response_parse",
+        "write_result",
+    ):
+        assert timing[f"{name}_sec"] >= 0
+        assert timing[f"{name}_count"] >= 1
+
+
 # ---------------------------------------------------------------------------
 # Retry behaviour
 # ---------------------------------------------------------------------------
@@ -633,3 +666,55 @@ def test_generate_caption_timeout_maps_to_timeout_failure_reason(monkeypatch: py
     result = _run_caption(stage, Window(start_frame=0, end_frame=1, mp4_bytes=b"\x00"))
     assert result.outcome == CaptionOutcome.ERROR
     assert result.failure_reason == "timeout"
+
+
+def test_filter_openai_stage_retries_malformed_model_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Filter requests should retry when vLLM returns invalid filter JSON."""
+    good = '{"post-production text":"yes","text_type":"hud_ui","reason":"HUD text is visible."}'
+    stage = _make_stage(monkeypatch, endpoint_key="filter", max_caption_retries=2)
+    create = AsyncMock(
+        side_effect=[
+            _FakeResponse([_FakeChoice("this is not json")]),
+            _FakeResponse([_FakeChoice(good)]),
+        ]
+    )
+    _attach_openai_async_client(stage, create)
+
+    result = _run_caption(stage, Window(start_frame=0, end_frame=1, mp4_bytes=b"\x00"))
+
+    assert create.call_count == 2
+    assert result.outcome == CaptionOutcome.SUCCESS
+    assert result.text == good
+
+
+def test_filter_openai_stage_sets_deterministic_sampling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Filter requests should ask the OpenAI-compatible endpoint for deterministic output."""
+    good = '{"post-production text":"no","text_type":"none","reason":"No overlay text."}'
+    stage = _make_stage(monkeypatch, endpoint_key="filter")
+    create = AsyncMock(return_value=_FakeResponse([_FakeChoice(good)]))
+    _attach_openai_async_client(stage, create)
+
+    result = _run_caption(stage, Window(start_frame=0, end_frame=1, mp4_bytes=b"\x00"))
+
+    assert result.outcome == CaptionOutcome.SUCCESS
+    assert create.call_args.kwargs["temperature"] == 0
+
+
+def test_filter_openai_stage_accepts_fallback_parse_on_final_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After retrying malformed JSON, the final fallback-parseable response can be kept."""
+    partial = '{"post-production text":"yes","text_type":"hud_ui","reason":"HUD text is visible.'
+    stage = _make_stage(monkeypatch, endpoint_key="filter", max_caption_retries=2)
+    create = AsyncMock(
+        side_effect=[
+            _FakeResponse([_FakeChoice(partial)]),
+            _FakeResponse([_FakeChoice(partial)]),
+        ]
+    )
+    _attach_openai_async_client(stage, create)
+
+    result = _run_caption(stage, Window(start_frame=0, end_frame=1, mp4_bytes=b"\x00"))
+
+    assert create.call_count == 2
+    assert result.outcome == CaptionOutcome.SUCCESS
+    assert result.text == partial
+
