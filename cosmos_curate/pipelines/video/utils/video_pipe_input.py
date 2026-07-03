@@ -17,6 +17,7 @@
 
 import json
 import pathlib
+from urllib.parse import quote, urlparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -37,6 +38,23 @@ from cosmos_curate.core.utils.storage.storage_utils import (
     read_json_file,
 )
 from cosmos_curate.pipelines.video.utils.data_model import ClipSample, SplitPipeTask, Video
+
+
+def is_http_url(path: str) -> bool:
+    """Return True when path is an HTTP(S) video URL."""
+    parsed = urlparse(path)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def url_to_input_key(url: str) -> str:
+    """Convert an HTTP(S) URL into a stable, storage-safe relative key."""
+    parsed = urlparse(url)
+    path = parsed.path.lstrip("/") or "index"
+    key = f"{parsed.netloc}/{path}"
+    if parsed.query:
+        key = f"{key}__query_{quote(parsed.query, safe='-_.=')}"
+    return key
+
 
 
 def _check_output_path(output_path: str, client: StorageClient | None) -> None:
@@ -97,6 +115,9 @@ def _read_video_list_json(
         raise
 
     for video_path in listed_input_videos:
+        if is_http_url(video_path):
+            input_videos.append(video_path)
+            continue
         _input_path = input_path.rstrip("/") + "/"
         if not video_path.startswith(_input_path):
             error_msg = f"Input video {video_path} is not in {_input_path}"
@@ -158,24 +179,30 @@ def extract_single_cam_split_tasks(  # noqa: PLR0913
 
     # apply filter func
     all_videos = list(input_videos)
+    all_video_keys = [url_to_input_key(x) if is_http_url(x) else x for x in all_videos]
     logger.info(f"Found {len(all_videos)} input videos in {input_path}")
     if verbose:
         for video in all_videos:
             logger.debug(video)
 
     # remove already processed videos
-    skipped_videos = [x for x in all_videos if x in processed_videos]
+    skipped_videos = [x for x, key in zip(all_videos, all_video_keys, strict=True) if key in processed_videos]
     if skipped_videos and verbose:
         logger.info(f"Skipping {len(skipped_videos)} already-processed video(s)")
 
-    raw_videos = [x for x in all_videos if x not in processed_videos]
+    raw_videos = [x for x, key in zip(all_videos, all_video_keys, strict=True) if key not in processed_videos]
     # apply limit
     if limit > 0:
         raw_videos = raw_videos[:limit]
     # prepare the final list of videos (single-cam: relative_path="" so clips go to clips/{uuid}.mp4)
+    videos = [
+        Video(x, relative_path="") if is_http_url(x) else Video(get_full_path(input_path, x), relative_path="")
+        for x in raw_videos
+    ]
+    input_video_keys = all_video_keys
     return (
-        [Video(get_full_path(input_path, x), relative_path="") for x in raw_videos],
-        all_videos,
+        videos,
+        input_video_keys,
         len(processed_videos),
     )
 

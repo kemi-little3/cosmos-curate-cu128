@@ -40,6 +40,7 @@ _CAPTION_CHOICES = frozenset(ALL_CAPTION_ALGOS)
 MAX_TARS_PER_PART_DEFAULT = 100
 TARGET_TAR_SIZE_MB_DEFAULT = 500
 MIN_CLIPS_PER_TAR_DEFAULT = 1
+SHARD_INPUT_MODES = frozenset({"clip", "window-package"})
 
 
 def add_shard_args(parser: argparse.ArgumentParser) -> None:
@@ -84,6 +85,17 @@ class ShardPipelineSettings:
         validator=validators.min_len(1),
         metadata=cli(help="Annotation version to use for clip metadata", default="v0"),
     )
+    shard_input_mode: str = attrs.field(
+        validator=validators.in_(SHARD_INPUT_MODES),
+        metadata=cli(
+            help=(
+                "Input mode for sharding: 'clip' reads split pipeline clips from summary/metas; "
+                "'window-package' reads package_output.json and per-window videos from --input-clip-path."
+            ),
+            default="clip",
+            choices=SHARD_INPUT_MODES,
+        ),
+    )
     input_semantic_dedup_s3_profile_name: str = attrs.field(
         validator=validators.min_len(1),
         metadata=cli(
@@ -127,6 +139,15 @@ class ShardPipelineSettings:
         metadata=cli(
             help=("Drop shards that have fewer than --min-clips-per-tar clips (default: False)."),
             default=False,
+            arg_type=None,
+            action=argparse.BooleanOptionalAction,
+        ),
+    )
+    generate_t5_embeddings: bool = attrs.field(
+        validator=validators.instance_of(bool),
+        metadata=cli(
+            help="Generate T5 embeddings before packing webdataset shards.",
+            default=True,
             arg_type=None,
             action=argparse.BooleanOptionalAction,
         ),

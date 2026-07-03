@@ -21,6 +21,7 @@ from unittest.mock import patch
 import pytest
 
 from cosmos_curate.pipelines.video.utils.video_pipe_input import (
+    _read_video_list_json,
     _multi_cam_session_to_split_task,
     _order_video_paths,
     extract_multi_cam_split_tasks,
@@ -94,6 +95,16 @@ def test_order_video_paths(
         result = _order_video_paths(paths, video_extensions, primary_camera_keyword)
         if expected is not None:
             assert result == expected
+
+
+def test_read_video_list_json_accepts_absolute_https_urls(tmp_path: Path) -> None:
+    """Absolute HTTP(S) URLs in an input list do not need to be under input_path."""
+    video_list = tmp_path / "videos.json"
+    video_list.write_text('["https://example.com/a.mp4", "https://example.com/nested/b.mp4"]')
+
+    result = _read_video_list_json("/local/input", str(video_list), "default")
+
+    assert result == ["https://example.com/a.mp4", "https://example.com/nested/b.mp4"]
 
 
 @pytest.mark.parametrize(

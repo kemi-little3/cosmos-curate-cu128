@@ -15,6 +15,7 @@
 """Tests for shard CLI ↔ settings alignment and attrs validation."""
 
 import argparse
+from pathlib import Path
 
 import attrs
 import pytest
@@ -109,13 +110,38 @@ def test_shard_parser_boolean_flags_use_action_not_type() -> None:
         "profile_memory",
         "profile_gpu",
         "drop_small_shards",
+        "generate_t5_embeddings",
     ):
         action = _action_for_dest(parser, dest)
         assert action is not None
         assert action.type is None, f"{dest}: expected no type= converter, got {action.type!r}"
 
 
-def test_shard_parser_parse_coerces_inferred_numeric_flags() -> None:
+def test_shard_parser_can_disable_t5_embeddings_for_cpu_only_packaging() -> None:
+    """Shard pipeline can skip T5 so webdataset packing can run without a GPU."""
+    parser = _shard_parser()
+    args = parser.parse_args(
+        [
+            "--input-clip-path",
+            "/data/clips",
+            "--output-dataset-path",
+            "/data/out",
+            "--no-generate-t5-embeddings",
+        ],
+    )
+    settings = _shard_settings_from_args(args)
+    assert settings.generate_t5_embeddings is False
+
+
+def test_shard_pipeline_adds_t5_stage_conditionally() -> None:
+    """The shard pipeline should not unconditionally include T5StageForShard."""
+    source = Path(__file__).parents[4] / "cosmos_curate/pipelines/video/sharding_pipeline.py"
+    text = source.read_text(encoding="utf-8")
+    assert "if settings.generate_t5_embeddings:" in text
+    assert "stages.append(" in text
+
+
+def test_shard_parser_coerces_numeric_fields() -> None:
     """End-to-end: inferred ``int`` / ``float`` types coerce argv values on parse."""
     parser = _shard_parser()
     args = parser.parse_args(
@@ -297,6 +323,8 @@ def test_shard_settings_rejects_empty_input_clip_path() -> None:
         output_dataset_path="/out",
         captioning_algorithm="qwen",
         annotation_version="v0",
+        shard_input_mode="clip",
+        generate_t5_embeddings=True,
         input_semantic_dedup_s3_profile_name="default",
         semantic_dedup_epsilon=0.01,
         max_tars_per_part=10,

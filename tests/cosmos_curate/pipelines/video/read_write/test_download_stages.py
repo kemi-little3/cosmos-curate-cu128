@@ -42,6 +42,21 @@ def _make_task(video: Video) -> Mock:
 class TestVideoDownloaderRemux:
     """Inline remux behaviour in VideoDownloader.process_data."""
 
+    @patch("cosmos_curate.pipelines.video.read_write.download_stages.requests.get")
+    def test_download_video_bytes_from_https_url(self, mock_get: MagicMock) -> None:
+        """HTTP(S) inputs are downloaded directly instead of through storage clients."""
+        response = Mock()
+        response.content = b"fake-video"
+        response.raise_for_status.return_value = None
+        mock_get.return_value = response
+
+        video = Video(input_video="https://example.com/video.mp4")
+        downloader = _make_downloader()
+
+        assert downloader._download_video_bytes(video) is True
+        mock_get.assert_called_once_with("https://example.com/video.mp4", timeout=300)
+        assert bytes(video.encoded_data.resolve()) == b"fake-video"
+
     @patch.object(Video, "populate_timestamps")
     @patch("cosmos_curate.pipelines.video.read_write.download_stages.remux_if_needed")
     @patch.object(VideoDownloader, "_extract_and_validate_metadata", return_value=True)

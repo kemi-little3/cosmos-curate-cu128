@@ -55,6 +55,7 @@ from cosmos_curate.pipelines.video.tracking.serialization import (
     sam3_instances_envelope,
     sam3_objects_envelope,
 )
+from cosmos_curate.pipelines.video.utils.video_pipe_input import is_http_url, url_to_input_key
 from cosmos_curate.pipelines.video.utils.data_model import (
     Clip,
     ClipStats,
@@ -643,21 +644,24 @@ class ClipWriterStage(CuratorStage):
             output_clip_file = f"{video_span_uuid}.{file_type}"
         return get_full_path(path_prefix, output_clip_file)
 
-    def _get_video_uri(self, input_video_path: str) -> storage_client.StoragePrefix | pathlib.Path:
+    def _get_input_video_key(self, input_video_path: str) -> str:
+        if is_http_url(input_video_path):
+            return url_to_input_key(input_video_path)
         assert input_video_path.startswith(self._input_path)
-        video_metadata_path = input_video_path[len(self._input_path) :] + ".json"
+        return input_video_path[len(self._input_path) :]
+
+    def _get_video_uri(self, input_video_path: str) -> storage_client.StoragePrefix | pathlib.Path:
+        video_metadata_path = self._get_input_video_key(input_video_path) + ".json"
         output_path_videos = self.get_output_path_processed_videos(self._output_path)
         return get_full_path(output_path_videos, video_metadata_path)
 
     def _get_clip_chunk_uri(self, input_video_path: str, idx: int) -> storage_client.StoragePrefix | pathlib.Path:
-        assert input_video_path.startswith(self._input_path)
-        clip_chunk_path = input_video_path[len(self._input_path) :] + f"_{idx}.json"
+        clip_chunk_path = self._get_input_video_key(input_video_path) + f"_{idx}.json"
         output_path_videos = self.get_output_path_processed_clip_chunks(self._output_path)
         return get_full_path(output_path_videos, clip_chunk_path)
 
     def _get_video_error_uri(self, input_video_path: str, idx: int) -> storage_client.StoragePrefix | pathlib.Path:
-        assert input_video_path.startswith(self._input_path)
-        error_chunk_path = input_video_path[len(self._input_path) :] + f"_{idx}.json"
+        error_chunk_path = self._get_input_video_key(input_video_path) + f"_{idx}.json"
         output_path_videos = self.get_output_path_video_errors(self._output_path)
         return get_full_path(output_path_videos, error_chunk_path)
 
@@ -1013,8 +1017,10 @@ class ClipWriterStage(CuratorStage):
     def _write_video_metadata(self, video: Video) -> None:  # noqa: C901
         if isinstance(video.input_video, storage_client.StoragePrefix):
             input_video_path = video.input_video.path
-        else:
+        elif isinstance(video.input_video, pathlib.Path):
             input_video_path = video.input_video.as_posix()
+        else:
+            input_video_path = video.input_video
 
         if video.errors:
             self._write_video_errors(video, input_video_path)

@@ -25,6 +25,7 @@ import argparse
 import collections
 import pathlib
 import time
+from typing import Any
 from collections.abc import Generator, Iterable
 
 from loguru import logger
@@ -40,6 +41,7 @@ from cosmos_curate.core.utils.storage.storage_utils import (
     get_directories_relative,
     get_full_path,
     get_storage_client,
+    read_json_file,
     verify_path,
 )
 from cosmos_curate.pipelines.common_pipeline_settings import (
@@ -64,6 +66,125 @@ from cosmos_curate.pipelines.video.utils.video_pipe_input import (
     extract_shard_tasks,
     filter_shard_tasks_by_semantic_dedup,
 )
+
+
+def _parse_window_dimensions(item: dict[str, Any]) -> tuple[int, int]:
+    raw_resolution = item.get("resolution")
+    if isinstance(raw_resolution, str) and raw_resolution:
+        normalized = raw_resolution.lower().replace("x", "*")
+        if "*" in normalized:
+            width_raw, height_raw = normalized.split("*", 1)
+            return int(width_raw), int(height_raw)
+
+    width = item.get("width")
+    height = item.get("height")
+    if width is None or height is None:
+        msg = f"Window package item {item.get('id')!r} is missing resolution/width/height"
+        raise ValueError(msg)
+    return int(width), int(height)
+
+
+def _parse_window_frame_range(item: dict[str, Any]) -> tuple[int | None, int | None]:
+    item_id = str(item.get("id", ""))
+    parts = item_id.rsplit("_", 2)
+    if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+        return int(parts[1]), int(parts[2])
+    return None, None
+
+
+def _parse_window_frame_num(item: dict[str, Any]) -> int:
+    raw_frame_num = item.get("frame_num")
+    if raw_frame_num is not None:
+        return int(raw_frame_num)
+    start_frame, end_frame = _parse_window_frame_range(item)
+    if start_frame is not None and end_frame is not None:
+        return end_frame - start_frame + 1
+    msg = f"Window package item {item.get('id')!r} is missing frame_num"
+    raise ValueError(msg)
+
+
+def _window_video_num_bytes(video_path: StoragePrefix | pathlib.Path, item: dict[str, Any]) -> int:
+    raw_num_bytes = item.get("num_bytes")
+    if raw_num_bytes is not None:
+        return int(raw_num_bytes)
+    if isinstance(video_path, pathlib.Path):
+        if not video_path.is_file():
+            msg = f"Missing window video file: {video_path}"
+            raise FileNotFoundError(msg)
+        return video_path.stat().st_size
+    return 0
+
+
+def extract_window_package_samples(
+    input_path: str,
+    input_s3_profile_name: str = "default",
+    *,
+    caption_field: str = "openai_caption",
+) -> list[ClipSample]:
+    """Extract per-window shard samples from package_output.json.
+
+    The package directory is expected to contain package_output.json with each item pointing to a
+    per-window mp4 via its relative video_path field.
+    """
+    client_input = get_storage_client(input_path, profile_name=input_s3_profile_name)
+    package_output_path = get_full_path(input_path, "package_output.json")
+    package_items = read_json_file(package_output_path, client_input)
+    if not isinstance(package_items, list):
+        msg = f"Expected {package_output_path} to contain a JSON list"
+        raise ValueError(msg)
+
+    samples: list[ClipSample] = []
+    for item in package_items:
+        if not isinstance(item, dict):
+            msg = f"Window package item must be an object, got {type(item).__name__}"
+            raise ValueError(msg)
+        item_id = str(item.get("id") or "")
+        video_rel_path = str(item.get("video_path") or "")
+        if not item_id or not video_rel_path:
+            msg = f"Window package item is missing id/video_path: {item!r}"
+            raise ValueError(msg)
+
+        video_path = get_full_path(input_path, video_rel_path)
+        width, height = _parse_window_dimensions(item)
+        frame_num = _parse_window_frame_num(item)
+        fps = float(item.get("fps") or 16)
+        num_bytes = _window_video_num_bytes(video_path, item)
+        caption = str(item.get("caption") or "")
+        start_frame, end_frame = _parse_window_frame_range(item)
+        window_metadata: dict[str, Any] = {caption_field: caption}
+        if start_frame is not None and end_frame is not None:
+            window_metadata["start_frame"] = start_frame
+            window_metadata["end_frame"] = end_frame
+
+        clip_metadata = dict(item)
+        clip_metadata.update(
+            {
+                "span_uuid": item_id,
+                "clip_location": str(video_path),
+                "width": width,
+                "height": height,
+                "framerate": fps,
+                "num_frames": frame_num,
+                "num_bytes": num_bytes,
+                "valid": True,
+                "has_caption": bool(caption),
+                "windows": [window_metadata],
+            },
+        )
+
+        samples.append(
+            ClipSample(
+                uuid=item_id,
+                width=width,
+                height=height,
+                num_frames=frame_num,
+                framerate=fps,
+                num_bytes=num_bytes,
+                clip_location=video_path,
+                clip_metadata=clip_metadata,
+            ),
+        )
+    return samples
 
 
 def _group_samples_by_bin(
@@ -226,15 +347,23 @@ def _shard(settings: ShardPipelineSettings, profiling_args_ns: argparse.Namespac
     create_path(settings.output_dataset_path)
 
     # get input samples
-    samples = extract_shard_tasks(
-        settings.input_clip_path,
-        output_dataset_path,
-        settings.common.input_s3_profile_name,
-        settings.common.output_s3_profile_name,
-        settings.annotation_version,
-        verbose=settings.common.verbose,
-    )
-    logger.info(f"Found {len(samples)} samples under input path {settings.input_clip_path}.")
+    if settings.shard_input_mode == "window-package":
+        samples = extract_window_package_samples(
+            settings.input_clip_path,
+            settings.common.input_s3_profile_name,
+            caption_field=f"{settings.captioning_algorithm}_caption",
+        )
+        logger.info(f"Found {len(samples)} window package samples under input path {settings.input_clip_path}.")
+    else:
+        samples = extract_shard_tasks(
+            settings.input_clip_path,
+            output_dataset_path,
+            settings.common.input_s3_profile_name,
+            settings.common.output_s3_profile_name,
+            settings.annotation_version,
+            verbose=settings.common.verbose,
+        )
+        logger.info(f"Found {len(samples)} clip samples under input path {settings.input_clip_path}.")
 
     if settings.input_semantic_dedup_path is not None:
         samples = filter_shard_tasks_by_semantic_dedup(
@@ -263,12 +392,16 @@ def _shard(settings: ShardPipelineSettings, profiling_args_ns: argparse.Namespac
         logger.warning("No tasks to process. Exiting ...")
         return
 
-    stages: list[CuratorStage | CuratorStageSpec] = [
-        T5StageForShard(
-            caption_fields=[f"{settings.captioning_algorithm}_caption"],
-            verbose=settings.common.verbose,
-            log_stats=settings.common.perf_profile,
-        ),
+    stages: list[CuratorStage | CuratorStageSpec] = []
+    if settings.generate_t5_embeddings:
+        stages.append(
+            T5StageForShard(
+                caption_fields=[f"{settings.captioning_algorithm}_caption"],
+                verbose=settings.common.verbose,
+                log_stats=settings.common.perf_profile,
+            ),
+        )
+    stages.append(
         CuratorStageSpec(
             DownloadPackUpload(
                 input_path=settings.input_clip_path,
@@ -280,7 +413,7 @@ def _shard(settings: ShardPipelineSettings, profiling_args_ns: argparse.Namespac
             ),
             num_workers_per_node=8,
         ),
-    ]
+    )
 
     output_packets: list[ShardPipeTask] = run_pipeline(
         tasks,

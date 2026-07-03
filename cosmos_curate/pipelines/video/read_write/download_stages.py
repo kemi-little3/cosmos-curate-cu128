@@ -19,6 +19,8 @@ import pathlib
 import pickle
 import subprocess
 
+import requests
+
 import numpy as np
 import nvtx  # type: ignore[import-untyped]
 from loguru import logger
@@ -97,7 +99,11 @@ class VideoDownloader(CuratorStage):
 
         """
         try:
-            if isinstance(video.input_video, pathlib.Path):
+            if isinstance(video.input_video, str) and video.input_video.startswith(("http://", "https://")):
+                response = requests.get(video.input_video, timeout=300)
+                response.raise_for_status()
+                video.encoded_data = bytes_to_numpy(response.content)  # type: ignore[assignment]
+            elif isinstance(video.input_video, pathlib.Path):
                 with video.input_video.open("rb") as fp:
                     video.encoded_data = bytes_to_numpy(fp.read())  # type: ignore[assignment]
             elif self._client is not None:

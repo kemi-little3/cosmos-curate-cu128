@@ -156,6 +156,7 @@ class S3Client(StorageClient):
             retries={"max_attempts": 3},
             connect_timeout=config.operation_timeout_s,
             read_timeout=config.operation_timeout_s,
+            s3={"addressing_style": "virtual"},
         )
         # If creds are set, specify them
         if config.aws_access_key_id is not None:

@@ -15,8 +15,9 @@
 """Tests for S3 client listing semantics."""
 
 from typing import Any
+from unittest.mock import Mock, patch
 
-from cosmos_curate.core.utils.storage.s3_client import S3Client, S3Prefix
+from cosmos_curate.core.utils.storage.s3_client import S3Client, S3ClientConfig, S3Prefix
 
 
 class _FakePaginator:
@@ -92,3 +93,23 @@ def test_list_recursive_without_limit_returns_all_pages() -> None:
     results = client.list_recursive(S3Prefix("s3://bucket/root"), limit=0)
     assert len(results) == 2
     assert [item["Key"] for item in results] == ["root/a.mp4", "root/b.mp4"]
+
+
+def test_s3_client_uses_virtual_hosted_addressing_style() -> None:
+    """Use virtual-hosted-style requests for S3-compatible endpoints such as TOS."""
+    with patch("cosmos_curate.core.utils.storage.s3_client.boto3.Session") as session_cls:
+        session = Mock()
+        session_cls.return_value = session
+
+        S3Client(
+            S3ClientConfig(
+                aws_access_key_id="access",
+                aws_secret_access_key="secret",
+                endpoint_url="https://tos-s3-ap-southeast-1.volces.com",
+                region="ap-southeast-1",
+            ),
+        )
+
+    client_kwargs = session.client.call_args.kwargs
+    assert client_kwargs["endpoint_url"] == "https://tos-s3-ap-southeast-1.volces.com"
+    assert client_kwargs["config"].s3 == {"addressing_style": "virtual"}
