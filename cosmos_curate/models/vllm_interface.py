@@ -114,6 +114,7 @@ from cosmos_curate.models.vllm_qwen import (
     VllmQwen3VL235BFP8,
     VllmQwen7B,
     VllmQwen3527B,
+    VllmQwen3627B,
 )
 from cosmos_curate.models.vllm_sentinels import VLLM_UNKNOWN_CAPTION
 from cosmos_curate.pipelines.video.utils.data_model import (
@@ -130,6 +131,7 @@ _VLLM_PLUGINS = {
     VllmCosmosReason2VL.model_variant(): VllmCosmosReason2VL,
     VllmNemotronNano12Bv2VL.model_variant(): VllmNemotronNano12Bv2VL,
     VllmQwen3527B.model_variant(): VllmQwen3527B,
+    VllmQwen3627B.model_variant(): VllmQwen3627B,
     VllmQwen3VL235B.model_variant(): VllmQwen3VL235B,
     VllmQwen3VL235BFP8.model_variant(): VllmQwen3VL235BFP8,
     VllmQwen3VL30B.model_variant(): VllmQwen3VL30B,

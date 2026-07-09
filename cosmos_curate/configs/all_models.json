@@ -158,6 +158,13 @@
         "precision": "FP8",
         "nvcf_model_id": "qwen3_5_27b"
     },
+    "qwen3_6_27b": {
+        "model_id": "Qwen/Qwen3.6-27B",
+        "version": null,
+        "filelist": null,
+        "precision": "BF16",
+        "nvcf_model_id": "qwen3_6_27b"
+    },
     "seedvr2_3b": {
         "model_id": "ByteDance-Seed/SeedVR2-3B",
         "version": "37255ff8cccfb01071b87f635a5948ca8d53117c",

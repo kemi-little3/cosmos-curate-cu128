@@ -554,7 +554,7 @@ class TransNetV2(ModelInterface):
         """
         return [_TRANSNETV2_MODEL_ID]
 
-    def setup(self) -> None:
+    def setup(self, device: str | torch.device = "cuda") -> None:
         """Set up the TransNetV2 model interface."""
         self._model = _TransNetV2()
         model_dir = model_utils.get_local_dir_for_weights_name(_TRANSNETV2_MODEL_ID)
@@ -564,7 +564,8 @@ class TransNetV2(ModelInterface):
             raise FileNotFoundError(error_msg)
         state_dict = torch.load(model_file.as_posix())
         self._model.load_state_dict(state_dict)
-        self._model.eval().cuda()
+        self._device = torch.device(device)
+        self._model.eval().to(self._device)
 
     def __call__(self, inputs: torch.Tensor) -> torch.Tensor:
         """TransNetV2 model call.
@@ -577,4 +578,4 @@ class TransNetV2(ModelInterface):
 
         """
         with torch.no_grad():
-            return self._model(inputs)  # type: ignore[no-any-return]
+            return self._model(inputs.to(self._device))  # type: ignore[no-any-return]

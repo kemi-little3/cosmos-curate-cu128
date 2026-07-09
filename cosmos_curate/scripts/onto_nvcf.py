@@ -116,6 +116,18 @@ def check_command_exists(command: str) -> bool:
     return shutil.which(command) is not None
 
 
+def _select_node_ip(hostname_i_output: str) -> str:
+    """Select one usable node IP from hostname -i output."""
+    ips = hostname_i_output.split()
+    for ip in ips:
+        if not ip.startswith("127."):
+            return ip
+    if ips:
+        return ips[0]
+    msg = "hostname -i returned no IP addresses"
+    raise ValueError(msg)
+
+
 def display_nvidia_smi() -> None:
     """Display NVIDIA SMI information for the current pod."""
     logger.info("NVIDIA SMI for Pod: %s", POD_NAME)
@@ -187,11 +199,11 @@ def start_ray_head() -> subprocess.Popen[str] | None:
 
     logger.info("Starting Ray head node")
     try:
-        hostname_ip: str = subprocess.check_output(
+        hostname_ip: str = _select_node_ip(subprocess.check_output(
             ["hostname", "-i"],  # noqa: S607
             text=True,
             timeout=5,
-        ).strip()
+        ))
 
         sys_cfg = {
             "local_fs_capacity_threshold": 0.90,
@@ -249,11 +261,11 @@ def start_ray_worker(head_pod: str) -> bool:
 
     logger.info("Starting Ray worker node and connecting to head at %s", head_pod)
     try:
-        hostname_ip: str = subprocess.check_output(
+        hostname_ip: str = _select_node_ip(subprocess.check_output(
             ["hostname", "-i"],  # noqa: S607
             text=True,
             timeout=5,
-        ).strip()
+        ))
         _: subprocess.CompletedProcess[str] = subprocess.run(  # noqa: S603
             [  # noqa: S607
                 "ray",

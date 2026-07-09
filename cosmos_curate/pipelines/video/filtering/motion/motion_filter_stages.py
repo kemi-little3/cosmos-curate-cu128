@@ -136,7 +136,7 @@ class MotionFilterStage(CuratorStage):
         score_only: bool,
         global_mean_threshold: float,
         per_patch_min_256_threshold: float,
-        num_gpus_per_worker: float = 0.5,
+        num_gpus_per_worker: float = 0.3,
         batch_size: int = 64,
         verbose: bool = False,
         log_stats: bool = False,

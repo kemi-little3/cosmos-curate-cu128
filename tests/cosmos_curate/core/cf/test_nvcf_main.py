@@ -67,6 +67,23 @@ def mock_request_id() -> str:
     return "test-request-id-12345"
 
 
+
+class TestLoggingSetup:
+    """Test logging setup integration."""
+
+    def test_setup_pipeline_middleware_attaches_logging_sink(self) -> None:
+        test_app = FastAPI()
+        with patch("cosmos_curate.core.cf.nvcf_main.get_logging_client") as mock_get_client, patch(
+            "cosmos_curate.core.cf.nvcf_main.logger.add"
+        ) as mock_add:
+            mock_client = SimpleNamespace(_logger=SimpleNamespace(logger=SimpleNamespace(name="test", handlers=[])))
+            mock_get_client.return_value = mock_client
+
+            nvcf_main.setup_pipeline_middleware(test_app)
+
+            mock_get_client.assert_called_once_with(enable_loki=False)
+            mock_add.assert_called_once()
+
 class TestHelperFunctions:
     """Test helper functions."""
 
@@ -603,6 +620,62 @@ class TestFastAPIEndpoints:
                     assert response.headers["CURATOR-PIPELINE-STATUS"] == "running"
                     assert "CURATOR-PIPELINE-PERCENT-COMPLETE" in response.headers
 
+    def test_run_pipeline_kemi_workflow_dispatch(self, test_client: TestClient, mock_request_id: str) -> None:
+        """Test /v1/run_pipeline dispatches kemi-workflow to the Python workflow wrapper."""
+        manager = MagicMock()
+        manager.Value.return_value = SimpleNamespace(value=False)
+        manager.Queue.return_value = queue.Queue()
+        manager.list.return_value = ["success"]
+        progress_thread = MagicMock()
+        stop_event = threading.Event()
+
+        with patch("cosmos_curate.core.cf.nvcf_main.Manager", return_value=manager):
+            with patch("cosmos_curate.core.cf.nvcf_main._setup_request", return_value=(progress_thread, stop_event)):
+                with patch("cosmos_curate.core.cf.nvcf_main.handle_presigned_urls", side_effect=lambda pipeline_type, args: args):
+                    with patch("cosmos_curate.core.cf.nvcf_main.execute_pipeline") as mock_execute:
+                        response = test_client.post(
+                            "/v1/run_pipeline",
+                            headers={"NVCF-REQID": mock_request_id},
+                            json={"pipeline": "kemi-workflow", "args": {"OUTPUT_PREFIX": "demo-run"}},
+                        )
+
+        assert response.status_code == HTTP_OK
+        mock_execute.assert_called_once()
+        called_args = mock_execute.call_args.args
+        assert called_args[1] is nvcf_main.nvcf_run_kemi_workflow
+        assert called_args[2] == mock_request_id
+        assert called_args[3].OUTPUT_PREFIX == "demo-run"
+        progress_thread.join.assert_called()
+        manager.shutdown.assert_called_once()
+
+    def test_run_pipeline_kemi_workflow_shell_dispatch(self, test_client: TestClient, mock_request_id: str) -> None:
+        """Test /v1/run_pipeline dispatches kemi-workflow-shell to the shell workflow wrapper."""
+        manager = MagicMock()
+        manager.Value.return_value = SimpleNamespace(value=False)
+        manager.Queue.return_value = queue.Queue()
+        manager.list.return_value = ["success"]
+        progress_thread = MagicMock()
+        stop_event = threading.Event()
+
+        with patch("cosmos_curate.core.cf.nvcf_main.Manager", return_value=manager):
+            with patch("cosmos_curate.core.cf.nvcf_main._setup_request", return_value=(progress_thread, stop_event)):
+                with patch("cosmos_curate.core.cf.nvcf_main.handle_presigned_urls", side_effect=lambda pipeline_type, args: args):
+                    with patch("cosmos_curate.core.cf.nvcf_main.execute_pipeline") as mock_execute:
+                        response = test_client.post(
+                            "/v1/run_pipeline",
+                            headers={"NVCF-REQID": mock_request_id},
+                            json={"pipeline": "kemi-workflow-shell", "args": {"OUTPUT_PREFIX": "demo-run"}},
+                        )
+
+        assert response.status_code == HTTP_OK
+        mock_execute.assert_called_once()
+        called_args = mock_execute.call_args.args
+        assert called_args[1] is nvcf_main.nvcf_run_kemi_workflow_shell
+        assert called_args[2] == mock_request_id
+        assert called_args[3].OUTPUT_PREFIX == "demo-run"
+        progress_thread.join.assert_called()
+        manager.shutdown.assert_called_once()
+
 
 class TestProcessExecution:
     """Test process execution functions."""
@@ -693,6 +766,77 @@ class TestProcessExecution:
                     stop_event.set()
                     progress_thread.join()
                     assert not progress_thread.is_alive()
+
+
+class TestKemiWorkflowWrapper:
+    """Test the external kemi workflow wrapper."""
+
+    def test_nvcf_run_kemi_workflow_invokes_outer_script(self) -> None:
+        args = argparse.Namespace(OUTPUT_PREFIX="demo-run", BATCH_SIZE=2)
+
+        with patch("cosmos_curate.core.cf.nvcf_main._get_kemi_workflow_script") as mock_script:
+            mock_path = MagicMock(spec=Path)
+            mock_path.is_file.return_value = True
+            mock_path.__str__.return_value = "/tmp/run_volc_worker_kemi.py"
+            mock_script.return_value = mock_path
+            with patch("subprocess.run") as mock_run:
+                nvcf_main.nvcf_run_kemi_workflow(args)
+
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args.args[0]
+        assert cmd[0] == nvcf_main.sys.executable
+        assert cmd[1] == "/tmp/run_volc_worker_kemi.py"
+        assert cmd[2] == "--config-json"
+        assert mock_run.call_args.kwargs["check"] is True
+
+    def test_nvcf_run_kemi_workflow_shell_invokes_outer_shell_script(self) -> None:
+        args = argparse.Namespace(OUTPUT_PREFIX="demo-run", BATCH_SIZE=2, GENERATE_T5_EMBEDDINGS=False)
+
+        with patch("cosmos_curate.core.cf.nvcf_main._get_kemi_workflow_shell_script") as mock_script:
+            mock_path = MagicMock(spec=Path)
+            mock_path.is_file.return_value = True
+            mock_path.__str__.return_value = "/tmp/run_volc_worker_kemi.sh"
+            mock_script.return_value = mock_path
+            with patch("subprocess.run") as mock_run:
+                nvcf_main.nvcf_run_kemi_workflow_shell(args)
+
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args.args[0]
+        env = mock_run.call_args.kwargs["env"]
+        assert cmd == ["bash", "/tmp/run_volc_worker_kemi.sh"]
+        assert env["OUTPUT_PREFIX"] == "demo-run"
+        assert env["BATCH_SIZE"] == "2"
+        assert env["GENERATE_T5_EMBEDDINGS"] == "False"
+        assert mock_run.call_args.kwargs["check"] is True
+
+    def test_nvcf_run_kemi_workflow_shell_sets_single_worker_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        args = argparse.Namespace(OUTPUT_PREFIX="demo-run")
+        monkeypatch.delenv("MLP_ROLE_INDEX", raising=False)
+        monkeypatch.delenv("MLP_WORKER_NUM", raising=False)
+        monkeypatch.delenv("WORKER_RANK", raising=False)
+        monkeypatch.delenv("WORKER_COUNT", raising=False)
+
+        with patch("cosmos_curate.core.cf.nvcf_main._get_kemi_workflow_shell_script") as mock_script:
+            mock_path = MagicMock(spec=Path)
+            mock_path.is_file.return_value = True
+            mock_path.__str__.return_value = "/tmp/run_volc_worker_kemi.sh"
+            mock_script.return_value = mock_path
+            with patch("subprocess.run") as mock_run:
+                nvcf_main.nvcf_run_kemi_workflow_shell(args)
+
+        env = mock_run.call_args.kwargs["env"]
+        assert env["MLP_ROLE_INDEX"] == "0"
+        assert env["MLP_WORKER_NUM"] == "1"
+        assert env["WORKER_RANK"] == "0"
+        assert env["WORKER_COUNT"] == "1"
+
+    def test_resolve_kemi_dp_root_prefers_workspace_prefix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("DP_ROOT", raising=False)
+        monkeypatch.setenv("COSMOS_CURATE_LOCAL_WORKSPACE_PREFIX", "/mlp-01/duanmengxuan/data_pipeline")
+
+        resolved = nvcf_main._resolve_kemi_dp_root()
+
+        assert resolved == Path("/mlp-01/duanmengxuan/data_pipeline")
 
 
 class TestExecutePipeline:

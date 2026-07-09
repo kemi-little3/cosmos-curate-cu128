@@ -45,11 +45,16 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
+
+from cosmos_curate.core.utils.infra.logging_sdk import get_logging_client
 from prometheus_client.parser import text_string_to_metric_families
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 from starlette.types import ASGIApp
 
+from cosmos_curate.core.cf.data_engine_adapter import parse_data_engine_request
+from cosmos_curate.core.cf.data_engine_callback import send_callback
+from cosmos_curate.core.cf.data_engine_packager import pack_source_uris
 from cosmos_curate.core.cf.nvcf_utils import (
     create_s3_profile,
     is_nvcf_container_deployment,
@@ -66,6 +71,9 @@ from cosmos_curate.pipelines.video.dedup_pipeline import nvcf_run_semdedup
 from cosmos_curate.pipelines.video.sharding_pipeline import nvcf_run_shard
 from cosmos_curate.pipelines.video.splitting_pipeline import nvcf_run_split
 
+KEMI_WORKFLOW_PIPELINE = "kemi-workflow"
+KEMI_WORKFLOW_SHELL_PIPELINE = "kemi-workflow-shell"
+
 _LOG_RDWR_LOCK_FILE = pathlib.Path(tempfile.gettempdir()) / "pipeline_status.lock"
 _PIPELINE_LOCK_FILE = pathlib.Path(tempfile.gettempdir()) / "pipeline.lock"
 _PIPELINE_STATUS_FILE = pathlib.Path(tempfile.gettempdir()) / "pipeline_status"
@@ -77,6 +85,11 @@ _METRICS_PORT = 9002
 # This is evaluated at startup and used to decide if the logs/progress can be sent
 # using get-request-status
 using_nvcf_status: dict[str, bool] = {"get_req_sts": False}
+
+
+def _setup_logging_sink() -> None:
+    """Initialize the project logging SDK without attaching invalid loguru sinks."""
+    _ = get_logging_client(enable_loki=True)
 
 
 def _cleanup_pipeline_lock_files() -> None:
@@ -528,6 +541,7 @@ class PipelineLockMiddleware(BaseHTTPMiddleware):
 
 def setup_pipeline_middleware(app: FastAPI) -> None:
     """Set up the pipeline middleware."""
+    _setup_logging_sink()
     # NVCF_REQUEST_STATUS indicates if this container will support using
     # NVCF get-request-status. If this flag is not present, is assumed true
     # when NVCF_SINGLE_NODE is true
@@ -719,6 +733,23 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
         invoke_args = await request.json()
         pipeline_type = invoke_args.get("pipeline", "unknown")
 
+        if pipeline_type == "pack_dataset_tars":
+            data_engine_request = parse_data_engine_request(invoke_args)
+            try:
+                pack_source_uris(data_engine_request)
+                send_callback(data_engine_request, succeeded=True)
+                return JSONResponse(
+                    status_code=200,
+                    content={"message": "Pipeline executed successfully", "logs": "success"},
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.exception("Data Engine adapter failed")
+                try:
+                    send_callback(data_engine_request, succeeded=False)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to send failure callback")
+                raise e
+
         pipeline_args = argparse.Namespace(**(invoke_args.get("args", {})))
 
         # Handle any presigned URL processing and ensure we now have a concrete Namespace
@@ -785,6 +816,26 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
             )
         elif pipeline_type in ("image-caption", "image-embed", "av-split"):
             pass
+        elif pipeline_type == KEMI_WORKFLOW_PIPELINE:
+            execute_pipeline(
+                _run_in_process,
+                nvcf_run_kemi_workflow,
+                request_id,
+                pipeline_args,
+                log_queue,
+                ipc_status,
+                stop_event,
+            )
+        elif pipeline_type == KEMI_WORKFLOW_SHELL_PIPELINE:
+            execute_pipeline(
+                _run_in_process,
+                nvcf_run_kemi_workflow_shell,
+                request_id,
+                pipeline_args,
+                log_queue,
+                ipc_status,
+                stop_event,
+            )
         elif pipeline_type == "semantic-dedup":
             execute_pipeline(
                 _run_in_process,
@@ -923,6 +974,83 @@ def _do_run_process(
         ipc_status.value = False
         error_msg = f"Process failed with return code {process.returncode}"
         raise RuntimeError(error_msg)
+
+
+def _resolve_kemi_dp_root() -> pathlib.Path:
+    explicit_dp_root = os.environ.get("DP_ROOT")
+    if explicit_dp_root:
+        return pathlib.Path(explicit_dp_root)
+
+    workspace_prefix = os.environ.get("COSMOS_CURATE_LOCAL_WORKSPACE_PREFIX")
+    if workspace_prefix:
+        candidate = pathlib.Path(workspace_prefix).expanduser()
+        if candidate.name == "data_pipeline":
+            return candidate
+        if candidate.name == "cosmos_curate_local_workspace":
+            return candidate.parent
+
+    code_dir = pathlib.Path(CONTAINER_PATHS_CODE_DIR)
+    for candidate in (code_dir.parent.parent, code_dir.parent, pathlib.Path.cwd()):
+        if (candidate / "scripts" / "run_volc_worker_kemi.sh").is_file():
+            return candidate
+
+    return pathlib.Path.cwd()
+
+
+def _get_kemi_workflow_script() -> pathlib.Path:
+    dp_root = _resolve_kemi_dp_root()
+    return dp_root / "scripts" / "run_volc_worker_kemi.py"
+
+
+def _get_kemi_workflow_shell_script() -> pathlib.Path:
+    dp_root = _resolve_kemi_dp_root()
+    return dp_root / "scripts" / "run_volc_worker_kemi.sh"
+
+
+def nvcf_run_kemi_workflow(args: argparse.Namespace) -> None:
+    script_path = _get_kemi_workflow_script()
+    if not script_path.is_file():
+        msg = f"kemi workflow script not found: {script_path}"
+        raise FileNotFoundError(msg)
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as fp:
+        json.dump(vars(args), fp, ensure_ascii=False, indent=2)
+        config_path = pathlib.Path(fp.name)
+
+    try:
+        subprocess.run(
+            [sys.executable, str(script_path), "--config-json", str(config_path)],
+            check=True,
+            cwd=CONTAINER_PATHS_CODE_DIR,
+        )
+    finally:
+        config_path.unlink(missing_ok=True)
+
+
+def nvcf_run_kemi_workflow_shell(args: argparse.Namespace) -> None:
+    script_path = _get_kemi_workflow_shell_script()
+    if not script_path.is_file():
+        msg = f"kemi workflow shell script not found: {script_path}"
+        raise FileNotFoundError(msg)
+
+    env = os.environ.copy()
+    env.setdefault("DP_ROOT", str(_resolve_kemi_dp_root()))
+    for key, value in vars(args).items():
+        if value is None:
+            continue
+        env[key] = str(value)
+
+    env.setdefault("MLP_ROLE_INDEX", "0")
+    env.setdefault("MLP_WORKER_NUM", "1")
+    env.setdefault("WORKER_RANK", env["MLP_ROLE_INDEX"])
+    env.setdefault("WORKER_COUNT", env["MLP_WORKER_NUM"])
+
+    subprocess.run(
+        ["bash", str(script_path)],
+        check=True,
+        cwd=CONTAINER_PATHS_CODE_DIR,
+        env=env,
+    )
 
 
 def execute_pipeline(  # noqa: PLR0913

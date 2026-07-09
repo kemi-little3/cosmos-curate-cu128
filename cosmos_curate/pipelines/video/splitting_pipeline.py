@@ -45,15 +45,11 @@ from cosmos_curate.core.utils.misc.stage_replay import (
     run_stage_replay,
     validate_stage_replay_args,
 )
-from cosmos_curate.core.utils.storage.storage_utils import (
-    create_path,
-    get_full_path,
-    is_path_nested,
-    verify_path,
-)
+from cosmos_curate.core.utils.storage.storage_utils import get_full_path
 from cosmos_curate.pipelines.pipeline_args import (
     add_common_args,
 )
+from cosmos_curate.pipelines.video.captioning.gemini_caption_stage import ApiPrepStage
 from cosmos_curate.pipelines.video.captioning.captioning_builders import (
     QWEN36_OPENAI_EXTRA_BODY,
     VLLM_CAPTION_ALGOS,
@@ -113,10 +109,8 @@ from cosmos_curate.pipelines.video.pose.pose_builders import (
     VipePoseConfig,
     build_vipe_pose_stages,
 )
-from cosmos_curate.pipelines.video.read_write.metadata_writer_stage import (
-    ClipWriterStage,
-    consolidate_lance_fragments,
-)
+from cosmos_curate.pipelines.video.read_write.input_sources import build_input_data as build_input_data_from_read_write
+from cosmos_curate.pipelines.video.read_write.metadata_writer_stage import ClipWriterStage, consolidate_lance_fragments
 from cosmos_curate.pipelines.video.read_write.read_write_builders import (
     IngestConfig,
     OutputConfig,
@@ -144,14 +138,9 @@ from cosmos_curate.pipelines.video.utils.data_model import (
     WeightedFrameWindowConfig,
     WindowConfig,
 )
-from cosmos_curate.pipelines.video.utils.video_pipe_input import (
-    extract_multi_cam_split_tasks,
-    extract_single_cam_split_tasks,
-    format_session_videos_tree,
-)
 
 QWEN2_CAPTION_ALGOS = {"qwen"}
-QWEN3_CAPTION_ALGOS = {"qwen3_5_27b", "qwen3_vl_30b", "qwen3_vl_30b_fp8", "qwen3_vl_235b", "qwen3_vl_235b_fp8"}
+QWEN3_CAPTION_ALGOS = {"qwen3_5_27b", "qwen3_6_27b", "qwen3_vl_30b", "qwen3_vl_30b_fp8", "qwen3_vl_235b", "qwen3_vl_235b_fp8"}
 COSMOS_REASON_ALGOS = {"cosmos_r1", "cosmos_r2"}
 ALL_CAPTION_ALGOS = VLLM_CAPTION_ALGOS | {"gemini", "openai", "vllm_async"}
 MULTICAM_VIDEO_EXTENSIONS: set[str] = {".mp4"}
@@ -196,85 +185,16 @@ def _get_qwen3_vl_235b_min_gpus() -> int:
 def build_input_data(
     args: argparse.Namespace,
 ) -> tuple[list[SplitPipeTask], list[str], int, int]:
-    """Build input data for the pipeline.
-
-    This function validates input arguments, extracts input data, and returns a list of tasks and relative paths.
-
-    Args:
-        args: Command line arguments.
-
-    Returns:
-        A tuple containing:
-        - A list of SplitPipeTask objects.
-        - A list of relative paths to the input videos.
-        - The number of processed videos.
-        - The number of input videos selected for this run after applying skip/limit semantics.
-
-    """
-    # validate input arguments
-    verify_path(args.input_video_path)
-    verify_path(args.output_clip_path, level=1)
-    create_path(args.output_clip_path)
-    if is_path_nested(args.input_video_path, args.output_clip_path):
-        error_msg = "Do not make input and output paths nested"
-        raise ValueError(error_msg)
-
-    if args.multi_cam and args.splitting_algorithm != "fixed-stride":
-        error_msg = "Multi-cam only supports fixed-stride splitting; set --splitting-algorithm fixed-stride"
-        raise ValueError(error_msg)
-
-    # extract input data
-    if args.multi_cam:
-        input_tasks = extract_multi_cam_split_tasks(
-            sessions_prefix=args.input_video_path,
-            primary_camera_keyword=args.primary_camera_keyword,
-            video_extensions=MULTICAM_VIDEO_EXTENSIONS,
-            input_s3_profile_name=args.input_s3_profile_name,
-            limit=args.limit,
-            verbose=args.verbose,
-        )
-
-        if args.verbose:
-            tree_output = format_session_videos_tree(input_tasks, args.input_video_path, limit=3)
-            logger.info(tree_output)
-
-        # TODO(jbowles): input_videos_relative is used for summary writing, which needs to be
-        # updated to support multicam. See docs/curator/design/MULTICAM.md for the plan for
-        # this update.
-        input_videos_relative: list[str] = []
-        num_processed = 0
-        num_input_videos_selected = len(input_tasks)
-        logger.info(f"About to process {len(input_tasks)} multi-cam session tasks ...")
-    else:
-        input_videos, input_videos_relative, num_processed = extract_single_cam_split_tasks(
-            input_path=args.input_video_path,
-            input_video_list_json_path=args.input_video_list_json_path,
-            output_path=args.output_clip_path,
-            output_video_path=ClipWriterStage.get_output_path_processed_videos(args.output_clip_path),
-            output_clip_chunk_path=ClipWriterStage.get_output_path_processed_clip_chunks(args.output_clip_path),
-            input_s3_profile_name=args.input_s3_profile_name,
-            input_video_list_s3_profile_name=args.input_video_list_s3_profile_name,
-            output_s3_profile_name=args.output_s3_profile_name,
-            limit=args.limit,
-            verbose=args.verbose,
-        )
-        input_tasks = [SplitPipeTask(videos=[video], session_id=str(video.input_video)) for video in input_videos]
-
-        if len(input_videos) == 0:
-            logger.warning(
-                "About to process 0 raw videos - all inputs were already processed. "
-                f"Remove the output directory {ClipWriterStage.get_output_path_processed_videos(args.output_clip_path)}"
-                " to reprocess.",
-            )
-        else:
-            logger.info(f"About to process {len(input_videos)} raw videos ...")
-
-        if args.verbose:
-            logger.debug("\n".join(str(x.input_video) for x in input_videos))
-        num_input_videos_selected = len(input_videos)
-
-    return input_tasks, input_videos_relative, num_processed, num_input_videos_selected
-
+    return build_input_data_from_read_write(
+        args,
+        multi_cam=args.multi_cam,
+        primary_camera_keyword=args.primary_camera_keyword,
+        input_s3_profile_name=args.input_s3_profile_name,
+        input_video_list_s3_profile_name=args.input_video_list_s3_profile_name,
+        output_s3_profile_name=args.output_s3_profile_name,
+        limit=args.limit,
+        verbose=args.verbose,
+    )
 
 def write_summary(
     args: argparse.Namespace,
@@ -326,6 +246,18 @@ def write_summary(
                 total_video_length += video.metadata.duration / 3600 if video.metadata.duration else 0
 
     return total_video_length
+
+
+def _build_caption_window_config(args: argparse.Namespace, weighted_frame_window_config: WeightedFrameWindowConfig | None) -> WindowConfig:
+    return WindowConfig(
+        window_size=args.frame_number or args.captioning_window_size,
+        remainder_threshold=args.captioning_remainder_threshold,
+        sampling_fps=args.captioning_sampling_fps,
+        preprocess_dtype=args.qwen_preprocess_dtype,
+        use_input_bit_rate=args.transcode_use_input_video_bit_rate,
+        drop_incomplete_windows=args.frame_number is not None or weighted_frame_window_config is not None,
+        weighted_frame_window_config=weighted_frame_window_config,
+    )
 
 
 def _get_vllm_sampling_defaults() -> dict[str, Any]:
@@ -725,13 +657,14 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
 
     # --- Captioning (optional) ---
     caption_algo = args.captioning_algorithm.lower()
+    captions_enabled = args.generate_captions and caption_algo != "disable"
     keep_mp4 = (
         args.generate_previews
         or (args.generate_cosmos_predict_dataset != "disable")
         or caption_algo in {"gemini", "openai"}
     )
 
-    if args.generate_captions:
+    if captions_enabled:
         if caption_algo not in ALL_CAPTION_ALGOS:
             msg = f"Unsupported captioning algorithm: {caption_algo}"
             raise RuntimeError(msg)
@@ -764,15 +697,7 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             performance_mode=args.vllm_performance_mode,
         )
 
-        window_config = WindowConfig(
-            window_size=args.frame_number or args.captioning_window_size,
-            remainder_threshold=args.captioning_remainder_threshold,
-            sampling_fps=args.captioning_sampling_fps,
-            preprocess_dtype=args.qwen_preprocess_dtype,
-            use_input_bit_rate=args.transcode_use_input_video_bit_rate,
-            drop_incomplete_windows=args.frame_number is not None or weighted_frame_window_config is not None,
-            weighted_frame_window_config=weighted_frame_window_config,
-        )
+        window_config = _build_caption_window_config(args, weighted_frame_window_config)
 
         if caption_algo in QWEN2_CAPTION_ALGOS | QWEN3_CAPTION_ALGOS:
             vllm_config.batch_size = args.qwen_batch_size
@@ -892,6 +817,19 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             )
         )
 
+    if not captions_enabled and args.enable_vipe_pose:
+        weighted_frame_window_config = _build_weighted_frame_window_config(args)
+        window_config = _build_caption_window_config(args, weighted_frame_window_config)
+        stages.append(
+            ApiPrepStage(
+                window_config=window_config,
+                model_variant="vipe",
+                num_cpus_for_prepare=args.vllm_prepare_num_cpus_per_worker,
+                verbose=args.verbose,
+                log_stats=args.perf_profile,
+            )
+        )
+
     # Per-event captioning consumes SAM3 outputs (instances + tracked.mp4),
     # so it requires SAM3 to be explicitly enabled. We don't auto-enable
     # it here — the user should opt into the SAM3 stage knowingly because
@@ -966,6 +904,8 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
                     vipe_python=args.vipe_python,
                     adapter_script=args.vipe_adapter_script,
                     fail_policy=args.vipe_fail_policy,
+                    run_mode=args.vipe_run_mode,
+                    vipe_repo=args.vipe_repo,
                     num_gpus_per_worker=args.vipe_gpus_per_worker,
                     num_workers_per_node=args.vipe_num_workers,
                     verbose=args.verbose,
@@ -980,7 +920,7 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
         stages.extend(
             build_t5_stages(
                 T5Config(
-                    caption_fields=[args.captioning_algorithm],
+                    caption_fields=[args.captioning_algorithm] if captions_enabled else [],
                     batch_size=args.t5_batch_size,
                     model_variant=args.t5_variant,
                     worker_max_lifetime_m=args.t5_worker_max_lifetime_m if args.t5_worker_max_lifetime_m >= 0 else None,
@@ -1013,8 +953,8 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
                 embedding_algorithm=args.embedding_algorithm,
                 embedding_model_version=embedding_model_version,
                 generate_previews=args.generate_previews,
-                caption_models=[args.captioning_algorithm],
-                enhanced_caption_models=[args.enhance_captions_lm_variant],
+                caption_models=[args.captioning_algorithm] if captions_enabled else [],
+                enhanced_caption_models=[args.enhance_captions_lm_variant] if captions_enabled and args.enhance_captions else [],
                 generate_cosmos_predict_dataset=args.generate_cosmos_predict_dataset,
                 vipe_pose_enabled=args.enable_vipe_pose,
                 vipe_fail_policy=args.vipe_fail_policy,
@@ -1326,6 +1266,23 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         help="How to handle windows whose ViPE pose estimation fails.",
     )
     parser.add_argument(
+        "--vipe-run-mode",
+        choices=["subprocess-window", "resident-window", "resident-clip"],
+        default="subprocess-window",
+        help=(
+            "ViPE execution strategy: subprocess-window is the baseline that starts "
+            "run_adapter.py for each window; resident-window keeps one external ViPE "
+            "worker alive but still runs each window independently; resident-clip runs "
+            "the transcoded clip once and slices pose outputs by window."
+        ),
+    )
+    parser.add_argument(
+        "--vipe-repo",
+        type=str,
+        default=None,
+        help="Path to the ViPE repo used by resident ViPE modes. Defaults next to the adapter script.",
+    )
+    parser.add_argument(
         "--vipe-gpus-per-worker",
         type=float,
         default=1.0,
@@ -1624,7 +1581,7 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
     parser.add_argument(
         "--motion-score-gpus-per-worker",
         type=float,
-        default=0.5,
+        default=0.3,
         help="Number of GPUs per worker allocated to motion score computation. Set to 0 to use CPU instead of GPU.",
     )
     parser.add_argument(
@@ -2099,8 +2056,8 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         "--captioning-algorithm",
         type=str,
         default="qwen",
-        choices=sorted(ALL_CAPTION_ALGOS),
-        help="Captioning algorithm to use in annotation pipeline.",
+        choices=sorted((*ALL_CAPTION_ALGOS, "disable")),
+        help="Captioning algorithm to use in annotation pipeline. Use disable to skip captioning stages.",
     )
     parser.add_argument(
         "--captioning-window-size",

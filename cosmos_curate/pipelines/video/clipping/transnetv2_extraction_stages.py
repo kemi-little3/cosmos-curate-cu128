@@ -105,7 +105,8 @@ class TransNetV2ClipExtractionStage(CuratorStage):
     def stage_setup(self) -> None:
         """Initialize stage resources and configuration."""
         gpu_stage_startup(self.__class__.__name__, self.resources.gpus, pre_setup=True)
-        self._model.setup()
+        device = "cuda" if self.resources.gpus > 0 else "cpu"
+        self._model.setup(device=device)
         gpu_stage_startup(self.__class__.__name__, self.resources.gpus, pre_setup=False)
 
     def destroy(self) -> None:
@@ -172,7 +173,8 @@ class TransNetV2ClipExtractionStage(CuratorStage):
                 if tuple(frames.shape[1:4]) != (27, 48, 3):
                     error_msg = f"Expected frames of shape 27x48x3, got {frames.shape[1:4]}."
                     raise ValueError(error_msg)
-                predictions = _get_predictions(self._model, frames, self.threshold)
+                device = torch.device("cuda" if self.resources.gpus > 0 else "cpu")
+                predictions = _get_predictions(self._model, frames, self.threshold, device)
                 scenes = _get_scenes(predictions, entire_scene_as_clip=self.entire_scene_as_clip)
                 if self._verbose:
                     logger.info(f"{video.input_video} returned {scenes.shape[0]} scenes")
@@ -238,6 +240,7 @@ def _get_predictions(
     model: Callable[[torch.Tensor], torch.Tensor],
     frames: npt.NDArray[np.uint8],
     threshold: float,
+    device: torch.device,
 ) -> npt.NDArray[np.uint8]:
     """Get predictions from the video frame array.
 
@@ -254,8 +257,8 @@ def _get_predictions(
     assert frames.ndim == fndims, "Expected frames tensor to have rank 4."
     predictions = []
     for batch in _get_batches(frames):
-        batch_gpu = torch.from_numpy(batch.copy()).cuda()
-        one_hot = model(batch_gpu.unsqueeze(0))
+        batch_tensor = torch.from_numpy(batch.copy()).to(device)
+        one_hot = model(batch_tensor.unsqueeze(0))
         predictions.append(one_hot[0, 25:75])
     predictions_ts = torch.concatenate(predictions, 0)[: len(frames)]
     return (predictions_ts > threshold).to(torch.uint8).cpu().numpy()

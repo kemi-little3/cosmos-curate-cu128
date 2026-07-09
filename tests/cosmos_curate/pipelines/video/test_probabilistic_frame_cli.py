@@ -109,3 +109,16 @@ def test_api_caption_worker_cli_defaults_and_overrides() -> None:
     )
     assert parsed.api_caption_num_workers_per_node == 8
     assert parsed.api_caption_cpus_per_worker == 0.5
+
+
+def test_vipe_run_mode_cli_defaults_and_overrides() -> None:
+    """ViPE run mode exposes all three benchmark variants."""
+    parser = argparse.ArgumentParser()
+    _setup_parser(parser)
+
+    defaults = parser.parse_args([])
+    assert defaults.vipe_run_mode == "subprocess-window"
+
+    for mode in ["subprocess-window", "resident-window", "resident-clip"]:
+        parsed = parser.parse_args(["--vipe-run-mode", mode])
+        assert parsed.vipe_run_mode == mode

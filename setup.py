@@ -20,6 +20,8 @@ It reads metadata from pyproject.toml, prepares the build directory structure,
 and configures the package for distribution.
 """
 
+"""lyx"""
+
 import shutil
 from pathlib import Path
 

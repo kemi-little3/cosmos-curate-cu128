@@ -33,7 +33,7 @@ class MotionFilterConfig:
     decode_cpus_per_worker: float = 2.0
     decode_target_fps: float = 2.0
     decode_target_duration_ratio: float = 0.5
-    score_gpus_per_worker: float = 0.5
+    score_gpus_per_worker: float = 0.3
     score_batch_size: int = 64
     verbose: bool = False
     perf_profile: bool = False
