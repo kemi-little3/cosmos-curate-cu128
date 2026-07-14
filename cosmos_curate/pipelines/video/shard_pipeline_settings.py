@@ -41,6 +41,7 @@ MAX_TARS_PER_PART_DEFAULT = 100
 TARGET_TAR_SIZE_MB_DEFAULT = 500
 MIN_CLIPS_PER_TAR_DEFAULT = 1
 SHARD_INPUT_MODES = frozenset({"clip", "window-package"})
+SHARD_OUTPUT_LAYOUTS = frozenset({"flat", "binned"})
 
 
 def add_shard_args(parser: argparse.ArgumentParser) -> None:
@@ -94,6 +95,18 @@ class ShardPipelineSettings:
             ),
             default="clip",
             choices=SHARD_INPUT_MODES,
+        ),
+    )
+    shard_output_layout: str = attrs.field(
+        validator=validators.in_(SHARD_OUTPUT_LAYOUTS),
+        metadata=cli(
+            help=(
+                "Output layout for webdataset shards: 'flat' writes video tar/json files under "
+                "<output-dataset-path>/datasets; 'binned' preserves the original resolution/aspect/duration "
+                "bin layout with video, metas, and t5_xxl tars."
+            ),
+            default="flat",
+            choices=SHARD_OUTPUT_LAYOUTS,
         ),
     )
     input_semantic_dedup_s3_profile_name: str = attrs.field(
@@ -161,6 +174,14 @@ class ShardPipelineSettings:
                 "S3 or local path to the dedup pipeline output root containing parquet files with semantically"
                 " deduplicated clip IDs (pass the directory containing 'extraction/', not the extraction/ path itself)"
             ),
+            default=None,
+        ),
+    )
+    target_tar_count: int | None = attrs.field(
+        default=None,
+        validator=validators.optional(validators.ge(1)),
+        metadata=cli(
+            help="Target total number of tar archives to write. Overrides --target-tar-size-mb when set.",
             default=None,
         ),
     )

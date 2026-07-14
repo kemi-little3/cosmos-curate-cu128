@@ -861,6 +861,7 @@ class ShardPipeTask(PipelineTask):
     output_tar_metas: storage_client.StoragePrefix | pathlib.Path
     output_tar_t5_xxl: storage_client.StoragePrefix | pathlib.Path
     key_count: int
+    write_auxiliary_tars: bool = True
     stage_perf: dict[str, StagePerfStats] = attrs.Factory(dict)
 
     def get_major_size(self) -> int:

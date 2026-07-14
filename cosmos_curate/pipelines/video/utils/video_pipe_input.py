@@ -15,11 +15,12 @@
 
 """Video Pipe Input."""
 
-import json
-import pathlib
-from urllib.parse import quote, urlparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import json
+import pathlib
+from urllib.parse import urlparse
 
 import pandas as pd
 from loguru import logger
@@ -49,12 +50,9 @@ def is_http_url(path: str) -> bool:
 def url_to_input_key(url: str) -> str:
     """Convert an HTTP(S) URL into a stable, storage-safe relative key."""
     parsed = urlparse(url)
-    path = parsed.path.lstrip("/") or "index"
-    key = f"{parsed.netloc}/{path}"
-    if parsed.query:
-        key = f"{key}__query_{quote(parsed.query, safe='-_.=')}"
-    return key
-
+    name = pathlib.PurePosixPath(parsed.path).name or "index"
+    url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    return f"{name}__url_{url_hash}"
 
 
 def _check_output_path(output_path: str, client: StorageClient | None) -> None:

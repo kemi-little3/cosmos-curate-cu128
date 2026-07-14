@@ -71,7 +71,7 @@ def mock_request_id() -> str:
 class TestLoggingSetup:
     """Test logging setup integration."""
 
-    def test_setup_pipeline_middleware_attaches_logging_sink(self) -> None:
+    def test_setup_pipeline_middleware_initializes_logging_client(self) -> None:
         test_app = FastAPI()
         with patch("cosmos_curate.core.cf.nvcf_main.get_logging_client") as mock_get_client, patch(
             "cosmos_curate.core.cf.nvcf_main.logger.add"
@@ -81,8 +81,8 @@ class TestLoggingSetup:
 
             nvcf_main.setup_pipeline_middleware(test_app)
 
-            mock_get_client.assert_called_once_with(enable_loki=False)
-            mock_add.assert_called_once()
+            mock_get_client.assert_called_once_with(enable_loki=True)
+            mock_add.assert_not_called()
 
 class TestHelperFunctions:
     """Test helper functions."""
@@ -674,6 +674,147 @@ class TestFastAPIEndpoints:
         assert called_args[2] == mock_request_id
         assert called_args[3].OUTPUT_PREFIX == "demo-run"
         progress_thread.join.assert_called()
+        manager.shutdown.assert_called_once()
+
+
+    def test_run_pipeline_data_engine_returns_accepted_and_starts_background(
+        self,
+        test_client: TestClient,
+        mock_request_id: str,
+        tmp_path: Path,
+    ) -> None:
+        """Test Data Engine requests return accepted before the shell workflow executes."""
+        payload = {
+            "pipeline": "pack_dataset_tars",
+            "pipeline_id": "pipeline-123",
+            "pipeline_task_id": "task-456",
+            "args": {
+                "source_uris": ["https://data-engine-test.tos/videos/a.mp4"],
+                "output_uri": "s3://data-lake/datasets/out-001",
+                "callback_url": "http://127.0.0.1:19090/datasets/process/callback",
+                "target_dataset_id": "dataset-789",
+                "tar_count": 3,
+            },
+        }
+        created_thread: dict[str, object] = {}
+
+        def fake_start_background(
+            request_id: str,
+            data_engine_request: object,
+            pipeline_args: argparse.Namespace,
+        ) -> None:
+            created_thread["started"] = True
+            created_thread["request_id"] = request_id
+            created_thread["data_engine_request"] = data_engine_request
+            created_thread["pipeline_args"] = pipeline_args
+
+        with patch("cosmos_curate.core.cf.nvcf_main._resolve_kemi_dp_root", return_value=tmp_path):
+            with patch(
+                "cosmos_curate.core.cf.nvcf_main._start_data_engine_pipeline_thread",
+                side_effect=fake_start_background,
+            ):
+                with patch("cosmos_curate.core.cf.nvcf_main.execute_pipeline") as mock_execute:
+                    with patch("cosmos_curate.core.cf.nvcf_main.send_callback") as mock_send_callback:
+                        response = test_client.post(
+                            "/v1/run_pipeline",
+                            headers={"NVCF-REQID": mock_request_id},
+                            json=payload,
+                        )
+
+        assert response.status_code == HTTP_OK
+        assert response.json() == {
+            "code": 0,
+            "message": "accepted",
+            "data": {
+                "pipeline_id": "pipeline-123",
+                "pipeline_task_id": "task-456",
+                "target_dataset_id": "dataset-789",
+                "accepted": True,
+            },
+        }
+        assert created_thread["started"] is True
+        assert created_thread["request_id"] == mock_request_id
+        pipeline_args = created_thread["pipeline_args"]
+        assert pipeline_args.OUTPUT_PREFIX == "task-456"
+        assert pipeline_args.RUN_SHARD == "1"
+        assert pipeline_args.SHARD_OUTPUT_DATASET_PATH == "s3://data-lake/datasets/out-001"
+        assert pipeline_args.SHARD_TARGET_TAR_COUNT == "3"
+        input_path = Path(pipeline_args.RAW_INPUT_VIDEO_LIST_JSON)
+        assert input_path == tmp_path / "input" / "data_engine" / "task-456.json"
+        assert json.loads(input_path.read_text(encoding="utf-8")) == payload["args"]["source_uris"]
+        mock_execute.assert_not_called()
+        mock_send_callback.assert_not_called()
+
+    def test_run_pipeline_data_engine_accepts_dynamic_pack_pipeline_name(
+        self,
+        test_client: TestClient,
+        mock_request_id: str,
+        tmp_path: Path,
+    ) -> None:
+        payload = {
+            "pipeline": "pack_dataset_tars_chain_1783928338",
+            "pipeline_id": "pipeline-123",
+            "pipeline_task_id": "task-456",
+            "args": {
+                "source_uris": ["https://data-engine-test.tos/videos/a.mp4"],
+                "output_uri": "s3://data-lake/datasets/out-001",
+                "callback_url": "http://127.0.0.1:19090/datasets/process/callback",
+                "target_dataset_id": "dataset-789",
+                "tar_count": 1,
+            },
+        }
+
+        with patch("cosmos_curate.core.cf.nvcf_main._resolve_kemi_dp_root", return_value=tmp_path):
+            with patch("cosmos_curate.core.cf.nvcf_main._start_data_engine_pipeline_thread") as mock_start:
+                response = test_client.post(
+                    "/v1/run_pipeline",
+                    headers={"NVCF-REQID": mock_request_id},
+                    json=payload,
+                )
+
+        assert response.status_code == HTTP_OK
+        assert response.json()["message"] == "accepted"
+        mock_start.assert_called_once()
+
+    def test_run_data_engine_pipeline_background_sends_success_callback(self) -> None:
+        """Test the Data Engine background runner executes the shell workflow and sends callback."""
+        manager = MagicMock()
+        manager.Value.return_value = SimpleNamespace(value=False)
+        manager.Queue.return_value = queue.Queue()
+        manager.list.return_value = ["success"]
+        progress_thread = MagicMock()
+        stop_event = threading.Event()
+        request = nvcf_main.parse_data_engine_request(
+            {
+                "pipeline": "pack_dataset_tars",
+                "pipeline_id": "pipeline-123",
+                "pipeline_task_id": "task-456",
+                "args": {
+                    "source_uris": ["https://data-engine-test.tos/videos/a.mp4"],
+                    "output_uri": "s3://data-lake/datasets/out-001",
+                    "callback_url": "http://127.0.0.1:19090/datasets/process/callback",
+                    "target_dataset_id": "dataset-789",
+                    "tar_count": 1,
+                },
+            }
+        )
+        pipeline_args = argparse.Namespace(OUTPUT_PREFIX="task-456")
+
+        with patch("cosmos_curate.core.cf.nvcf_main.Manager", return_value=manager):
+            with patch("cosmos_curate.core.cf.nvcf_main._setup_request", return_value=(progress_thread, stop_event)):
+                with patch("cosmos_curate.core.cf.nvcf_main.handle_presigned_urls", side_effect=lambda pipeline_type, args: args):
+                    with patch("cosmos_curate.core.cf.nvcf_main.execute_pipeline") as mock_execute:
+                        with patch("cosmos_curate.core.cf.nvcf_main._count_data_engine_success_videos", return_value=1):
+                            with patch("cosmos_curate.core.cf.nvcf_main.send_callback") as mock_send_callback:
+                                nvcf_main._run_data_engine_pipeline_background("req-1", request, pipeline_args)
+
+        mock_execute.assert_called_once()
+        called_args = mock_execute.call_args.args
+        assert called_args[1] is nvcf_main.nvcf_run_kemi_workflow_shell
+        assert called_args[2] == "req-1"
+        assert called_args[3] is pipeline_args
+        mock_send_callback.assert_called_once_with(request, succeeded=True, total_videos=1, success_videos=1)
+        progress_thread.join.assert_called_once()
         manager.shutdown.assert_called_once()
 
 

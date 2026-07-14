@@ -30,7 +30,7 @@ import attrs
 from loguru import logger
 
 from cosmos_curate.core.utils.misc.retry_utils import do_with_retries
-from cosmos_curate.core.utils.storage import azure_client, s3_client
+from cosmos_curate.core.utils.storage import azure_client, object_storage_sdk_client, s3_client
 from cosmos_curate.core.utils.storage.azure_client import AzurePrefix, is_azure_path
 from cosmos_curate.core.utils.storage.s3_client import S3Prefix, is_s3path
 from cosmos_curate.core.utils.storage.storage_client import StorageClient, StoragePrefix
@@ -63,6 +63,14 @@ def get_storage_client(
 
     """
     if is_s3path(target_path):
+        sdk_client = object_storage_sdk_client.create_object_storage_sdk_client(
+            target_path,
+            profile_name,
+            can_overwrite=can_overwrite,
+            can_delete=can_delete,
+        )
+        if sdk_client is not None:
+            return sdk_client
         return s3_client.create_s3_client(
             target_path,
             profile_name,

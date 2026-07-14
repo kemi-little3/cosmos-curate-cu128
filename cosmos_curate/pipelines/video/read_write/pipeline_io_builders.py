@@ -58,8 +58,8 @@ class VideoInputPreparationStage:
         self.config = config
 
     def run(self) -> VideoInputPreparationResult:
-        if bool(self.config.input_video_path) == bool(self.config.input_video_list_json_path):
-            raise ValueError("Exactly one of input_video_path or input_video_list_json_path must be set")
+        if not self.config.input_video_path and not self.config.input_video_list_json_path:
+            raise ValueError("input_video_path or input_video_list_json_path must be set")
 
         if self.config.input_video_list_json_path:
             if not self.config.input_video_path:

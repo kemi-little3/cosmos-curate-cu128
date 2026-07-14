@@ -25,6 +25,7 @@ from cosmos_curate.pipelines.video.utils.video_pipe_input import (
     _multi_cam_session_to_split_task,
     _order_video_paths,
     extract_multi_cam_split_tasks,
+    url_to_input_key,
 )
 
 
@@ -105,6 +106,23 @@ def test_read_video_list_json_accepts_absolute_https_urls(tmp_path: Path) -> Non
     result = _read_video_list_json("/local/input", str(video_list), "default")
 
     assert result == ["https://example.com/a.mp4", "https://example.com/nested/b.mp4"]
+
+
+def test_url_to_input_key_flattens_presigned_urls() -> None:
+    """Presigned URL keys are stable, flat, and short enough for local metadata paths."""
+    url = (
+        "http://127.0.0.1:9000/data-lake/videos/2026-07-13/VOZWENQN__f61ec674.mp4"
+        "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=admin%2F20260713%2Fus-east-1%2Fs3%2Faws4_request"
+        "&X-Amz-Date=20260713T090330Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host"
+        "&X-Amz-Signature=04bcdca92e674ecef9bca4c12c3b780565c1ca491bb76a25d0cd93ce357ad3ff"
+    )
+
+    key = url_to_input_key(url)
+
+    assert key.startswith("VOZWENQN__f61ec674.mp4__url_")
+    assert "/" not in key
+    assert "X-Amz" not in key
+    assert len(key) < 128
 
 
 @pytest.mark.parametrize(

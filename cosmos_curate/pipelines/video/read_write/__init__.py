@@ -15,13 +15,35 @@
 
 """Video file I/O and format conversion utilities."""
 
+from typing import Any
+
 from cosmos_curate.pipelines.video.read_write.input_sources import build_input_data
 from cosmos_curate.pipelines.video.read_write.input_preparation_builders import build_duration_balanced_input_shards, build_input_json_from_video_dir
-from cosmos_curate.pipelines.video.read_write.pipeline_io_builders import (
-    VideoInputPreparationConfig,
-    VideoInputPreparationResult,
-    VideoInputPreparationStage,
-    VideoOutputShardingConfig,
-    VideoOutputShardingResult,
-    VideoOutputShardingStage,
-)
+
+_PIPELINE_IO_EXPORTS = {
+    "VideoInputPreparationConfig",
+    "VideoInputPreparationResult",
+    "VideoInputPreparationStage",
+    "VideoOutputShardingConfig",
+    "VideoOutputShardingResult",
+    "VideoOutputShardingStage",
+}
+
+__all__ = [
+    "build_duration_balanced_input_shards",
+    "build_input_data",
+    "build_input_json_from_video_dir",
+    *_PIPELINE_IO_EXPORTS,
+]
+
+
+def __getattr__(name: str) -> Any:
+    if name not in _PIPELINE_IO_EXPORTS:
+        msg = f"module {__name__!r} has no attribute {name!r}"
+        raise AttributeError(msg)
+
+    from cosmos_curate.pipelines.video.read_write import pipeline_io_builders
+
+    value = getattr(pipeline_io_builders, name)
+    globals()[name] = value
+    return value

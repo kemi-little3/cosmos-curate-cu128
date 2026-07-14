@@ -322,6 +322,30 @@ class DownloadPackUpload(CuratorStage):
             client=self._client_output,
         )
 
+    @staticmethod
+    def _get_manifest_path(
+        output_tar_path: storage_client.StoragePrefix | pathlib.Path,
+    ) -> storage_client.StoragePrefix | pathlib.Path:
+        if isinstance(output_tar_path, pathlib.Path):
+            return output_tar_path.with_suffix(".json")
+
+        output_tar = str(output_tar_path)
+        output_json = f"{output_tar[:-4]}.json" if output_tar.endswith(".tar") else f"{output_tar}.json"
+        return storage_utils.get_full_path(output_json)
+
+    def _write_video_manifest(self, task: ShardPipeTask) -> None:
+        manifest = {"files": [{"name": f"{clip.uuid}.mp4"} for clip in task.samples]}
+        manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
+        manifest_path = self._get_manifest_path(task.output_tar_video)
+        write_bytes(
+            manifest_bytes,
+            manifest_path,
+            "video manifest",
+            str(task.part_num),
+            verbose=self._verbose,
+            client=self._client_output,
+        )
+
     @nvtx.annotate("DownloadPackUpload")  # type: ignore[untyped-decorator]
     def process_data(self, tasks: list[ShardPipeTask]) -> list[ShardPipeTask] | None:
         """Read video specified in URI to task buffer."""
@@ -338,19 +362,22 @@ class DownloadPackUpload(CuratorStage):
                 clip_mp4_data = clip.encoded_data.resolve()
                 mp4_bytes = clip_mp4_data.tobytes() if clip_mp4_data is not None else b""
                 samples_to_write_mp4.append(webdataset_utils.RawSample(clip.uuid, {"mp4": mp4_bytes}))
-                samples_to_write_t5_xxls.append(
-                    webdataset_utils.RawSample(clip.uuid, {"pickle": pickle.dumps(clip.t5_xxl_embeddings)}),
-                )
-                samples_to_write_metas.append(
-                    webdataset_utils.RawSample(clip.uuid, {"json": json.dumps(clip.clip_metadata)}),
-                )
+                if task.write_auxiliary_tars:
+                    samples_to_write_t5_xxls.append(
+                        webdataset_utils.RawSample(clip.uuid, {"pickle": pickle.dumps(clip.t5_xxl_embeddings)}),
+                    )
+                    samples_to_write_metas.append(
+                        webdataset_utils.RawSample(clip.uuid, {"json": json.dumps(clip.clip_metadata)}),
+                    )
                 task.key_count += 1
             tar_bytes_mp4 = webdataset_utils.make_tar_from_samples(samples_to_write_mp4)
-            tar_bytes_t5_xxls = webdataset_utils.make_tar_from_samples(samples_to_write_t5_xxls)
-            tar_bytes_metas = webdataset_utils.make_tar_from_samples(samples_to_write_metas)
             self._write_tar(tar_bytes_mp4, task.output_tar_video, "video", task.part_num)
-            self._write_tar(tar_bytes_t5_xxls, task.output_tar_t5_xxl, "t5_xxl", task.part_num)
-            self._write_tar(tar_bytes_metas, task.output_tar_metas, "metas", task.part_num)
+            self._write_video_manifest(task)
+            if task.write_auxiliary_tars:
+                tar_bytes_t5_xxls = webdataset_utils.make_tar_from_samples(samples_to_write_t5_xxls)
+                tar_bytes_metas = webdataset_utils.make_tar_from_samples(samples_to_write_metas)
+                self._write_tar(tar_bytes_t5_xxls, task.output_tar_t5_xxl, "t5_xxl", task.part_num)
+                self._write_tar(tar_bytes_metas, task.output_tar_metas, "metas", task.part_num)
 
             # clear intermediate buffers
             for clip in task.samples:

@@ -52,9 +52,12 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.responses import Response
 from starlette.types import ASGIApp
 
-from cosmos_curate.core.cf.data_engine_adapter import parse_data_engine_request
-from cosmos_curate.core.cf.data_engine_callback import send_callback
-from cosmos_curate.core.cf.data_engine_packager import pack_source_uris
+from cosmos_curate.core.cf.data_engine_adapter import (
+    DataEngineRequest,
+    build_kemi_workflow_shell_args,
+    parse_data_engine_request,
+)
+from cosmos_curate.core.cf.data_engine_callback import build_accepted_response, send_callback
 from cosmos_curate.core.cf.nvcf_utils import (
     create_s3_profile,
     is_nvcf_container_deployment,
@@ -110,6 +113,12 @@ def _cleanup_pipeline_lock_files() -> None:
 
 def _value_error(msg: str) -> None:
     raise ValueError(msg)
+
+
+def _is_data_engine_pack_pipeline(pipeline_type: object) -> bool:
+    if not isinstance(pipeline_type, str):
+        return False
+    return pipeline_type == "pack_dataset_tars" or pipeline_type.startswith("pack_dataset_tars_")
 
 
 def _setup_request(
@@ -691,8 +700,30 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
     progress_thread = None
     nvcf_output_dir = None
     pipeline_args = None
+    data_engine_request = None
+    pipeline_type = "unknown"
+    upload_pipeline_type = None
 
     try:
+        invoke_args = await request.json()
+        pipeline_type = invoke_args.get("pipeline", KEMI_WORKFLOW_SHELL_PIPELINE)
+        request_id = request.headers.get("NVCF-REQID")
+        if request_id is None:
+            logger.warning("NVCF-REQID is missing, generating fake request-id")
+            request_id = str(uuid.uuid4())
+
+        if _is_data_engine_pack_pipeline(pipeline_type):
+            data_engine_request = parse_data_engine_request(invoke_args)
+            pipeline_args = build_kemi_workflow_shell_args(
+                data_engine_request,
+                workspace_prefix=_resolve_kemi_dp_root(),
+            )
+            _start_data_engine_pipeline_thread(request_id, data_engine_request, pipeline_args)
+            return JSONResponse(
+                status_code=200,
+                content=build_accepted_response(data_engine_request),
+            )
+
         nvcf_output_dir = get_asset_output_path(request)
         manager = Manager()
 
@@ -712,11 +743,6 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
         logger.info(f"NVCF-LARGE-OUTPUT-DIR: {nvcf_output_dir}")
         logger.info(f"NVCF-Curator node={socket.gethostname()} pid={os.getpid()}")
 
-        request_id = request.headers.get("NVCF-REQID")
-        if request_id is None:
-            logger.warning("NVCF-REQID is missing, generating fake request-id")
-            request_id = str(uuid.uuid4())  # Generate a fake request-id
-
         logger.info(f"Request ID: {request_id}")
         output_dir = nvcf_output_dir if using_nvcf_status["get_req_sts"] else None
         if output_dir is None:
@@ -730,30 +756,16 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
             logs,
         )
 
-        invoke_args = await request.json()
-        pipeline_type = invoke_args.get("pipeline", "unknown")
-
-        if pipeline_type == "pack_dataset_tars":
-            data_engine_request = parse_data_engine_request(invoke_args)
-            try:
-                pack_source_uris(data_engine_request)
-                send_callback(data_engine_request, succeeded=True)
-                return JSONResponse(
-                    status_code=200,
-                    content={"message": "Pipeline executed successfully", "logs": "success"},
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.exception("Data Engine adapter failed")
-                try:
-                    send_callback(data_engine_request, succeeded=False)
-                except Exception:  # noqa: BLE001
-                    logger.exception("Failed to send failure callback")
-                raise e
-
         pipeline_args = argparse.Namespace(**(invoke_args.get("args", {})))
+        upload_pipeline_type = pipeline_type
+
+        # Kemi shell is the default serving path when pipeline is omitted. Both
+        # explicit split and Kemi shell use split-style presigned input/output handling.
+        presigned_pipeline_type = "split" if pipeline_type in {"split", KEMI_WORKFLOW_SHELL_PIPELINE} else pipeline_type
+        upload_pipeline_type = presigned_pipeline_type
 
         # Handle any presigned URL processing and ensure we now have a concrete Namespace
-        pipeline_args = handle_presigned_urls(pipeline_type, pipeline_args)
+        pipeline_args = handle_presigned_urls(presigned_pipeline_type, pipeline_args)
 
         # At this point `pipeline_args` **must** be a populated Namespace object.
         # Add an explicit runtime assertion so static type-checkers understand this.
@@ -766,8 +778,9 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
             pipeline_args.s3_config = "REDACTED"
 
         logger.info(f"Launching pipeline {pipeline_type} with args: {pipeline_args}")
-        if pipeline_type in {"split"}:
-            # handle possible assets. Do not override presigned URL paths.
+        if pipeline_type == "split":
+            # Keep explicit split as the legacy/debug split endpoint. This path
+            # intentionally uses NVCF asset output defaults such as /tmp/nvcf_output.
             if not getattr(pipeline_args, "input_presigned_s3_url", None) and input_assets_present(request):
                 pipeline_args.input_video_path = get_asset_input_dir(request)
 
@@ -776,10 +789,8 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
             if not getattr(pipeline_args, "output_clip_path", None):
                 pipeline_args.output_clip_path = get_asset_output_path(request)
 
-            # Validate that we have either a direct path or a presigned URL for both input and output
             missing_input_path = not getattr(pipeline_args, "input_video_path", None)
             missing_input_url = not getattr(pipeline_args, "input_presigned_s3_url", None)
-
             missing_output_path = not getattr(pipeline_args, "output_clip_path", None)
             missing_output_url = not getattr(pipeline_args, "output_presigned_s3_url", None)
 
@@ -793,17 +804,54 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
                     "Invalid Pipeline args: Either output_clip_path or output_presigned_s3_url must be provided",
                 )
 
-            # run the pipeline
-            if pipeline_type == "split":
-                execute_pipeline(
-                    _run_in_process,
-                    nvcf_run_split,
-                    request_id,
-                    pipeline_args,
-                    log_queue,
-                    ipc_status,
-                    stop_event,
+            execute_pipeline(
+                _run_in_process,
+                nvcf_run_split,
+                request_id,
+                pipeline_args,
+                log_queue,
+                ipc_status,
+                stop_event,
+            )
+        elif pipeline_type == KEMI_WORKFLOW_SHELL_PIPELINE:
+            # Kemi shell owns output path defaults. Do not inject NVCF's
+            # /tmp/nvcf_output asset path here, or the worker cannot create
+            # per-prefix/per-batch workspace outputs.
+            if not getattr(pipeline_args, "input_presigned_s3_url", None) and input_assets_present(request):
+                pipeline_args.input_video_path = get_asset_input_dir(request)
+
+            missing_input_path = not getattr(pipeline_args, "input_video_path", None)
+            missing_input_list = not (
+                getattr(pipeline_args, "input_video_list_json_path", None)
+                or getattr(pipeline_args, "raw_input_video_list_json", None)
+                or getattr(pipeline_args, "RAW_INPUT_VIDEO_LIST_JSON", None)
+            )
+            missing_input_dir = not (
+                getattr(pipeline_args, "raw_input_video_dir", None)
+                or getattr(pipeline_args, "RAW_INPUT_VIDEO_DIR", None)
+            )
+            missing_prepared_shards = not (
+                getattr(pipeline_args, "prepared_shard_list_json", None)
+                or getattr(pipeline_args, "PREPARED_SHARD_LIST_JSON", None)
+            )
+            missing_input_url = not getattr(pipeline_args, "input_presigned_s3_url", None)
+
+            if missing_input_path and missing_input_list and missing_input_dir and missing_prepared_shards and missing_input_url:
+                _value_error(
+                    "Invalid Pipeline args: input_video_path, input_video_list_json_path/raw_input_video_list_json, raw_input_video_dir, prepared_shard_list_json, or input_presigned_s3_url must be provided",
                 )
+
+            pipeline_args = _build_kemi_workflow_shell_args(pipeline_args, request_id)
+            logger.info(f"Launching {KEMI_WORKFLOW_SHELL_PIPELINE} with args: {pipeline_args}")
+            execute_pipeline(
+                _run_in_process,
+                nvcf_run_kemi_workflow_shell,
+                request_id,
+                pipeline_args,
+                log_queue,
+                ipc_status,
+                stop_event,
+            )
         elif pipeline_type == "shard":
             execute_pipeline(
                 _run_in_process,
@@ -820,16 +868,6 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
             execute_pipeline(
                 _run_in_process,
                 nvcf_run_kemi_workflow,
-                request_id,
-                pipeline_args,
-                log_queue,
-                ipc_status,
-                stop_event,
-            )
-        elif pipeline_type == KEMI_WORKFLOW_SHELL_PIPELINE:
-            execute_pipeline(
-                _run_in_process,
-                nvcf_run_kemi_workflow_shell,
                 request_id,
                 pipeline_args,
                 log_queue,
@@ -891,8 +929,146 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
             progress_thread.join()
         if did_init_s3_profile:
             remove_s3_profile()
-        if pipeline_args is not None:
-            gather_and_upload_outputs(pipeline_type, pipeline_args)
+        if pipeline_args is not None and upload_pipeline_type is not None:
+            gather_and_upload_outputs(upload_pipeline_type, pipeline_args)
+        if manager:
+            manager.shutdown()
+
+
+def _start_data_engine_pipeline_thread(
+    request_id: str,
+    data_engine_request: DataEngineRequest,
+    pipeline_args: argparse.Namespace,
+) -> threading.Thread:
+    thread = threading.Thread(
+        target=_run_data_engine_pipeline_background,
+        args=(request_id, data_engine_request, pipeline_args),
+        name=f"data-engine-pipeline-{request_id}",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def _read_num_processed_videos(summary_path: pathlib.Path) -> int | None:
+    try:
+        data = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(f"Failed to read Data Engine summary {summary_path}: {exc}")
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    value = data.get("num_processed_videos")
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _count_data_engine_success_videos(pipeline_args: argparse.Namespace) -> int:
+    output_subdir = _get_namespace_value(pipeline_args, "OUTPUT_SUBDIR", "output_subdir")
+    if output_subdir is None:
+        output_prefix = _get_namespace_value(pipeline_args, "OUTPUT_PREFIX", "output_prefix")
+        if output_prefix is None:
+            return 0
+        worker_rank = _get_namespace_value(pipeline_args, "WORKER_RANK", "worker_rank") or os.environ.get(
+            "MLP_ROLE_INDEX",
+            "0",
+        )
+        output_subdir = f"{output_prefix}_{worker_rank}"
+
+    output_root = _resolve_kemi_dp_root() / "cosmos_curate_local_workspace" / str(output_subdir)
+    top_summary = output_root / "summary.json"
+    if top_summary.is_file():
+        return _read_num_processed_videos(top_summary) or 0
+
+    total = 0
+    found_summary = False
+    for summary_path in sorted(output_root.glob("batch_*/summary.json")):
+        count = _read_num_processed_videos(summary_path)
+        if count is not None:
+            total += count
+            found_summary = True
+    return total if found_summary else 0
+
+
+def _run_data_engine_pipeline_background(
+    request_id: str,
+    data_engine_request: DataEngineRequest,
+    pipeline_args: argparse.Namespace,
+) -> None:
+    """Run a Data Engine request after the HTTP accepted response has been sent."""
+
+    did_init_s3_profile = False
+    manager = None
+    stop_event = None
+    progress_thread = None
+    log_queue = None
+    total_videos = len(data_engine_request.args.source_uris)
+    success_videos = 0
+
+    try:
+        output_dir = tempfile.gettempdir()
+        manager = Manager()
+        ipc_status: Any = manager.Value(ctypes.c_bool, value=False)
+        log_queue = cast("multiprocessing.Queue", manager.Queue())  # type: ignore[type-arg]
+        logs: list[str] | MutableSequence[Any] = manager.list() if using_nvcf_status["get_req_sts"] else ["success"]
+
+        progress_thread, stop_event = _setup_request(
+            output_dir,
+            log_queue,
+            ipc_status,
+            request_id,
+            logs,
+        )
+
+        pipeline_args = handle_presigned_urls(KEMI_WORKFLOW_SHELL_PIPELINE, pipeline_args)
+        assert isinstance(pipeline_args, argparse.Namespace)
+
+        if hasattr(pipeline_args, "s3_config"):
+            did_init_s3_profile = create_s3_profile(pipeline_args.s3_config)
+            pipeline_args.s3_config = "REDACTED"
+
+        logger.info(f"Launching Data Engine pipeline {KEMI_WORKFLOW_SHELL_PIPELINE} with args: {pipeline_args}")
+        execute_pipeline(
+            _run_in_process,
+            nvcf_run_kemi_workflow_shell,
+            request_id,
+            pipeline_args,
+            log_queue,
+            ipc_status,
+            stop_event,
+        )
+        success_videos = _count_data_engine_success_videos(pipeline_args)
+        send_callback(
+            data_engine_request,
+            succeeded=True,
+            total_videos=total_videos,
+            success_videos=success_videos,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(f"Data Engine pipeline failed: {exc}")
+        success_videos = _count_data_engine_success_videos(pipeline_args)
+        try:
+            send_callback(
+                data_engine_request,
+                succeeded=False,
+                total_videos=total_videos,
+                success_videos=success_videos,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to send Data Engine failure callback")
+    finally:
+        if stop_event and not stop_event.is_set():
+            stop_event.set()
+        if progress_thread:
+            progress_thread.join()
+        if did_init_s3_profile:
+            remove_s3_profile()
         if manager:
             manager.shutdown()
 
@@ -975,6 +1151,112 @@ def _do_run_process(
         error_msg = f"Process failed with return code {process.returncode}"
         raise RuntimeError(error_msg)
 
+
+
+def _safe_shell_component(value: str | None) -> str:
+    """Return a filesystem/env-safe component for generated Kemi run names."""
+    if not value:
+        return "kemi-split-request"
+    cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value).strip("._")
+    return cleaned or "kemi-split-request"
+
+
+def _get_namespace_value(args: argparse.Namespace, *names: str) -> Any:
+    for name in names:
+        if hasattr(args, name):
+            value = getattr(args, name)
+            if value is not None and value != "":
+                return value
+    return None
+
+
+def _as_shell_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return str(value)
+
+
+def _build_kemi_workflow_shell_args(args: argparse.Namespace, request_id: str | None) -> argparse.Namespace:
+    """Convert API or shell-style request args into env args for run_volc_worker_kemi.sh."""
+    shell_args: dict[str, str] = {}
+
+    # Preserve explicit shell-style overrides first.
+    for key, value in vars(args).items():
+        if value is None:
+            continue
+        if key.isupper():
+            shell_args[key] = _as_shell_value(value)
+
+    output_prefix = _get_namespace_value(args, "OUTPUT_PREFIX", "output_prefix")
+    shell_args.setdefault("OUTPUT_PREFIX", _safe_shell_component(str(output_prefix or request_id or uuid.uuid4())))
+
+    raw_root = _get_namespace_value(args, "RAW_INPUT_VIDEO_ROOT", "raw_input_video_root", "input_video_root")
+    raw_dir = _get_namespace_value(args, "RAW_INPUT_VIDEO_DIR", "raw_input_video_dir")
+    raw_list = _get_namespace_value(
+        args,
+        "RAW_INPUT_VIDEO_LIST_JSON",
+        "raw_input_video_list_json",
+        "input_video_list_json_path",
+    )
+    prepared_shards = _get_namespace_value(
+        args,
+        "PREPARED_SHARD_LIST_JSON",
+        "prepared_shard_list_json",
+        "input_shard_list_json",
+    )
+    input_video_path = _get_namespace_value(args, "input_video_path")
+
+    if prepared_shards is not None:
+        shell_args.setdefault("PREPARED_SHARD_LIST_JSON", str(prepared_shards))
+    elif raw_list is not None:
+        shell_args.setdefault("RAW_INPUT_VIDEO_LIST_JSON", str(raw_list))
+        if raw_root is not None:
+            shell_args.setdefault("RAW_INPUT_VIDEO_ROOT", str(raw_root))
+    else:
+        if raw_dir is None:
+            raw_dir = input_video_path
+        if raw_root is None:
+            raw_root = input_video_path or raw_dir
+        if raw_root is not None:
+            shell_args.setdefault("RAW_INPUT_VIDEO_ROOT", str(raw_root))
+        if raw_dir is not None:
+            shell_args.setdefault("RAW_INPUT_VIDEO_DIR", str(raw_dir))
+
+    container_root = _get_namespace_value(args, "CONTAINER_INPUT_VIDEO_ROOT", "container_input_video_root")
+    if container_root is not None:
+        shell_args.setdefault("CONTAINER_INPUT_VIDEO_ROOT", str(container_root))
+
+    output_clip_path = _get_namespace_value(args, "OUTPUT_CLIP_PATH", "output_clip_path")
+    if output_clip_path is not None:
+        shell_args.setdefault("OUTPUT_CLIP_PATH", str(output_clip_path))
+
+    batch_size = _get_namespace_value(args, "BATCH_SIZE", "batch_size")
+    if batch_size is not None:
+        shell_args.setdefault("BATCH_SIZE", str(batch_size))
+
+    generate_t5 = _get_namespace_value(args, "GENERATE_T5_EMBEDDINGS", "generate_t5_embeddings")
+    if generate_t5 is not None:
+        shell_args.setdefault("GENERATE_T5_EMBEDDINGS", _as_shell_value(generate_t5))
+
+    passthrough = {
+        "API_CAPTION_WORKERS": "api_caption_workers",
+        "API_CAPTION_BATCH_SIZE": "api_caption_batch_size",
+        "API_PREP_CPUS_PER_WORKER": "api_prep_cpus_per_worker",
+        "VLLM_MAX_NUM_SEQS": "vllm_max_num_seqs",
+        "CLIP_RE_CHUNK_SIZE": "clip_re_chunk_size",
+        "TRANSCODE_TARGET_WIDTH": "transcode_target_width",
+        "TRANSCODE_TARGET_HEIGHT": "transcode_target_height",
+        "RUN_SHARD": "run_shard",
+        "SHARD_OUTPUT_DATASET_PATH": "shard_output_dataset_path",
+        "OUTPUT_CLIP_ROOT": "output_clip_root",
+        "DRY_RUN": "dry_run",
+    }
+    for env_name, arg_name in passthrough.items():
+        value = _get_namespace_value(args, env_name, arg_name)
+        if value is not None:
+            shell_args.setdefault(env_name, _as_shell_value(value))
+
+    return argparse.Namespace(**shell_args)
 
 def _resolve_kemi_dp_root() -> pathlib.Path:
     explicit_dp_root = os.environ.get("DP_ROOT")

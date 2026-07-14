@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from cosmos_curate.core.utils.storage import azure_client, s3_client, storage_utils
+from cosmos_curate.core.utils.storage import azure_client, object_storage_sdk_client, s3_client, storage_utils
 from cosmos_curate.core.utils.storage.storage_client import StoragePrefix
 
 from .conftest import FakeStorageClient
@@ -42,12 +42,18 @@ def test_get_storage_client_dispatches_to_implementations(
     s3_stub = object()
     azure_stub = object()
     s3_args: tuple[str, str, bool, bool] | None = None
+    sdk_args: tuple[str, str, bool, bool] | None = None
     azure_args: tuple[str, str, bool, bool] | None = None
 
     def fake_s3_create(target_path: str, profile_name: str, *, can_overwrite: bool, can_delete: bool) -> object:
         nonlocal s3_args
         s3_args = (target_path, profile_name, can_overwrite, can_delete)
         return s3_stub
+
+    def fake_sdk_create(target_path: str, profile_name: str, *, can_overwrite: bool, can_delete: bool) -> object | None:
+        nonlocal sdk_args
+        sdk_args = (target_path, profile_name, can_overwrite, can_delete)
+        return None
 
     def fake_azure_create(
         target_path: str,
@@ -60,6 +66,7 @@ def test_get_storage_client_dispatches_to_implementations(
         azure_args = (target_path, profile_name, can_overwrite, can_delete)
         return azure_stub
 
+    monkeypatch.setattr(object_storage_sdk_client, "create_object_storage_sdk_client", fake_sdk_create)
     monkeypatch.setattr(s3_client, "create_s3_client", fake_s3_create)
     monkeypatch.setattr(azure_client, "create_azure_client", fake_azure_create)
 
@@ -72,6 +79,7 @@ def test_get_storage_client_dispatches_to_implementations(
         )
         is s3_stub
     )
+    assert sdk_args == (_remote_path("path"), "profile", True, True)
     assert s3_args == (_remote_path("path"), "profile", True, True)
 
     assert (
@@ -83,6 +91,38 @@ def test_get_storage_client_dispatches_to_implementations(
     )
     assert azure_args == ("az://container/blob", "azure-profile", False, False)
     assert storage_utils.get_storage_client(str(tmp_path / "local")) is None
+
+
+def test_get_storage_client_prefers_object_storage_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route configured Data Engine buckets to ObjectStorageSDK before boto3."""
+    sdk_stub = object()
+    s3_called = False
+    sdk_args: tuple[str, str, bool, bool] | None = None
+
+    def fake_sdk_create(target_path: str, profile_name: str, *, can_overwrite: bool, can_delete: bool) -> object:
+        nonlocal sdk_args
+        sdk_args = (target_path, profile_name, can_overwrite, can_delete)
+        return sdk_stub
+
+    def fake_s3_create(*args: object, **kwargs: object) -> object:
+        nonlocal s3_called
+        s3_called = True
+        return object()
+
+    monkeypatch.setattr(object_storage_sdk_client, "create_object_storage_sdk_client", fake_sdk_create)
+    monkeypatch.setattr(s3_client, "create_s3_client", fake_s3_create)
+
+    assert (
+        storage_utils.get_storage_client(
+            "s3://data-lake/datasets/task",
+            profile_name="profile",
+            can_overwrite=True,
+            can_delete=True,
+        )
+        is sdk_stub
+    )
+    assert sdk_args == ("s3://data-lake/datasets/task", "profile", True, True)
+    assert not s3_called
 
 
 def test_get_lance_storage_options_from_profiles(monkeypatch: pytest.MonkeyPatch) -> None:

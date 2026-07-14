@@ -35,10 +35,11 @@ from cosmos_curate.core.interfaces.stage_interface import CuratorStage, CuratorS
 from cosmos_curate.core.utils.config import args_utils
 from cosmos_curate.core.utils.dataset import dimensions, webdataset_utils
 from cosmos_curate.core.utils.misc import grouping
-from cosmos_curate.core.utils.storage.storage_client import StoragePrefix
+from cosmos_curate.core.utils.storage.storage_client import StorageClient, StoragePrefix
 from cosmos_curate.core.utils.storage.storage_utils import (
     create_path,
     get_directories_relative,
+    get_files_relative,
     get_full_path,
     get_storage_client,
     read_json_file,
@@ -66,6 +67,8 @@ from cosmos_curate.pipelines.video.utils.video_pipe_input import (
     extract_shard_tasks,
     filter_shard_tasks_by_semantic_dedup,
 )
+
+FLAT_SHARD_DATASETS_DIR = "datasets"
 
 
 def _parse_window_dimensions(item: dict[str, Any]) -> tuple[int, int]:
@@ -234,20 +237,195 @@ def _group_samples_by_size(
         yield out
 
 
+def _group_samples_by_count(
+    samples: list[ClipSample],
+    target_tar_count: int,
+    *,
+    drop_small_shards: bool,
+    min_clips_per_tar: int = MIN_CLIPS_PER_TAR_DEFAULT,
+) -> Generator[list[ClipSample], None, None]:
+    if target_tar_count < 1:
+        msg = "target_tar_count must be positive"
+        raise ValueError(msg)
+    if not samples:
+        return
+
+    total_size = sum(max(0, sample.num_bytes) for sample in samples)
+    target_size_bytes = max(1, (total_size + target_tar_count - 1) // target_tar_count)
+    emitted = 0
+    current_size = 0
+    out: list[ClipSample] = []
+
+    for idx, sample in enumerate(samples):
+        remaining_samples = len(samples) - idx
+        remaining_bins = target_tar_count - emitted
+        must_leave_samples = remaining_bins > 1 and remaining_samples <= remaining_bins
+        should_split = bool(out) and emitted + 1 < target_tar_count and (
+            current_size + sample.num_bytes > target_size_bytes or must_leave_samples
+        )
+        if should_split:
+            if not (drop_small_shards and len(out) < min_clips_per_tar):
+                emitted += 1
+                yield out
+            out = [sample]
+            current_size = sample.num_bytes
+        else:
+            out.append(sample)
+            current_size += sample.num_bytes
+
+    if out and not (drop_small_shards and len(out) < min_clips_per_tar):
+        yield out
+
+
+def _allocate_target_tar_counts(
+    grouped_by_bin: dict[dimensions.ResolutionAspectRatioFrames | None, list[ClipSample]],
+    target_tar_count: int | None,
+) -> dict[dimensions.ResolutionAspectRatioFrames, int]:
+    if target_tar_count is None:
+        return {}
+
+    valid_bins = [(lbin, bin_samples) for lbin, bin_samples in grouped_by_bin.items() if lbin is not None and bin_samples]
+    if not valid_bins:
+        return {}
+
+    if target_tar_count < len(valid_bins):
+        logger.warning(
+            f"target_tar_count={target_tar_count} is smaller than the number of non-empty bins={len(valid_bins)}; "
+            "emitting at least one tar per bin."
+        )
+
+    total_target_count = max(target_tar_count, len(valid_bins))
+    remaining = total_target_count - len(valid_bins)
+    allocations = {lbin: 1 for lbin, _ in valid_bins}
+    if remaining == 0:
+        return allocations
+
+    bin_sizes = {
+        lbin: sum(max(0, sample.num_bytes) for sample in bin_samples)
+        for lbin, bin_samples in valid_bins
+    }
+    total_size = sum(bin_sizes.values())
+    if total_size <= 0:
+        for idx in range(remaining):
+            allocations[valid_bins[idx % len(valid_bins)][0]] += 1
+        return allocations
+
+    fractional_remainders: list[tuple[float, dimensions.ResolutionAspectRatioFrames]] = []
+    assigned_extra = 0
+    for lbin, _ in valid_bins:
+        exact_extra = remaining * bin_sizes[lbin] / total_size
+        extra = int(exact_extra)
+        allocations[lbin] += extra
+        assigned_extra += extra
+        fractional_remainders.append((exact_extra - extra, lbin))
+
+    for _, lbin in sorted(fractional_remainders, key=lambda item: item[0], reverse=True)[: remaining - assigned_extra]:
+        allocations[lbin] += 1
+    return allocations
+
+
+def _next_flat_tar_num(output_path: StoragePrefix | pathlib.Path, client_output: StorageClient | None) -> int:
+    existing_files = get_files_relative(str(output_path), client_output)
+    existing_tar_nums = []
+    for item in existing_files:
+        path = pathlib.PurePosixPath(item)
+        if path.parent != pathlib.PurePosixPath(".") or path.suffix != ".tar" or not path.stem.isdigit():
+            continue
+        existing_tar_nums.append(int(path.stem))
+    return max(existing_tar_nums, default=-1) + 1
+
+
+def _group_samples_into_flat_tasks(  # noqa: PLR0913
+    samples: Iterable[ClipSample],
+    *,
+    drop_small_shards: bool,
+    target_tar_size_bytes: int,
+    target_tar_count: int | None,
+    min_clips_per_tar: int,
+    output_path: str,
+    output_s3_profile_name: str,
+) -> tuple[list[ShardPipeTask], list[StoragePrefix | pathlib.Path], int]:
+    tasks: list[ShardPipeTask] = []
+    valid_samples: list[ClipSample] = []
+    num_dropped_samples = 0
+    grouped_by_bin = _group_samples_by_bin(samples)
+    for lbin, binned_samples in grouped_by_bin.items():
+        if lbin is None:
+            logger.warning(f"Found {len(binned_samples)} samples which do not correspond to a lbin. Ignoring them ...")
+            num_dropped_samples += len(binned_samples)
+            continue
+        valid_samples.extend(binned_samples)
+
+    flat_root = get_full_path(output_path)
+    flat_dataset_path = get_full_path(output_path, FLAT_SHARD_DATASETS_DIR)
+    client_output = get_storage_client(output_path, profile_name=output_s3_profile_name)
+    starting_tar_num = _next_flat_tar_num(flat_dataset_path, client_output)
+    logger.info(f"Writing flat shard output under {flat_dataset_path}; starting tar number: {starting_tar_num}")
+
+    grouped_samples = (
+        _group_samples_by_count(
+            valid_samples,
+            target_tar_count,
+            drop_small_shards=drop_small_shards,
+            min_clips_per_tar=min_clips_per_tar,
+        )
+        if target_tar_count is not None
+        else _group_samples_by_size(
+            valid_samples,
+            target_tar_size_bytes,
+            drop_small_shards=drop_small_shards,
+            min_clips_per_tar=min_clips_per_tar,
+        )
+    )
+    for tar_idx, tar_samples in enumerate(grouped_samples, start=starting_tar_num):
+        tar_name = webdataset_utils.make_tar_path_str(tar_idx)
+        tasks.append(
+            ShardPipeTask(
+                str(flat_root),
+                tar_idx,
+                tar_samples,
+                get_full_path(flat_dataset_path, tar_name),
+                get_full_path(flat_root, "metas", tar_name),
+                get_full_path(flat_root, "t5_xxl", tar_name),
+                key_count=0,
+                write_auxiliary_tars=False,
+            ),
+        )
+    return tasks, [flat_root], num_dropped_samples
+
+
 def _group_samples_into_tasks(  # noqa: PLR0913
     samples: Iterable[ClipSample],
     *,
     drop_small_shards: bool,
     max_tars_per_part: int,
     target_tar_size_bytes: int,
+    target_tar_count: int | None,
     min_clips_per_tar: int,
     output_path: str,
     output_s3_profile_name: str,
+    output_layout: str = "binned",
 ) -> tuple[list[ShardPipeTask], list[StoragePrefix | pathlib.Path], int]:
+    if output_layout == "flat":
+        tasks, all_bins, num_dropped_samples = _group_samples_into_flat_tasks(
+            samples,
+            drop_small_shards=drop_small_shards,
+            target_tar_size_bytes=target_tar_size_bytes,
+            target_tar_count=target_tar_count,
+            min_clips_per_tar=min_clips_per_tar,
+            output_path=output_path,
+            output_s3_profile_name=output_s3_profile_name,
+        )
+        logger.info(f"Created {len(tasks)} flat shard tasks:")
+        for task in tasks:
+            logger.info(f"tar={task.part_num} output={task.output_tar_video}, samples={len(task.samples)}")
+        return tasks, all_bins, num_dropped_samples
+
     tasks: list[ShardPipeTask] = []
     all_bins: list[StoragePrefix | pathlib.Path] = []
     num_dropped_samples: int = 0
     grouped_by_bin = _group_samples_by_bin(samples)
+    target_tar_counts_by_bin = _allocate_target_tar_counts(grouped_by_bin, target_tar_count)
     client_output = get_storage_client(output_path, profile_name=output_s3_profile_name)
     for lbin, binned_samples in grouped_by_bin.items():
         sample_count = len(binned_samples)
@@ -276,14 +454,25 @@ def _group_samples_into_tasks(  # noqa: PLR0913
         )
         logger.info(f"Starting part number: {starting_part_num}")
 
+        bin_target_tar_count = target_tar_counts_by_bin.get(lbin)
+        grouped_samples = (
+            _group_samples_by_count(
+                binned_samples,
+                bin_target_tar_count,
+                drop_small_shards=drop_small_shards,
+                min_clips_per_tar=min_clips_per_tar,
+            )
+            if bin_target_tar_count is not None
+            else _group_samples_by_size(
+                binned_samples,
+                target_tar_size_bytes,
+                drop_small_shards=drop_small_shards,
+                min_clips_per_tar=min_clips_per_tar,
+            )
+        )
         for part_idx, tar_group in enumerate(
             grouping.split_by_chunk_size(
-                _group_samples_by_size(
-                    binned_samples,
-                    target_tar_size_bytes,
-                    drop_small_shards=drop_small_shards,
-                    min_clips_per_tar=min_clips_per_tar,
-                ),
+                grouped_samples,
                 max_tars_per_part,
             ),
         ):
@@ -341,7 +530,11 @@ def _shard(settings: ShardPipelineSettings, profiling_args_ns: argparse.Namespac
     """
     start_time = time.time()
     # validate input arguments
-    output_dataset_path = str(get_full_path(settings.output_dataset_path, settings.annotation_version))
+    output_dataset_path = (
+        str(get_full_path(settings.output_dataset_path, settings.annotation_version))
+        if settings.shard_output_layout == "binned"
+        else settings.output_dataset_path
+    )
     verify_path(settings.input_clip_path)
     verify_path(settings.output_dataset_path, level=1)
     create_path(settings.output_dataset_path)
@@ -383,9 +576,11 @@ def _shard(settings: ShardPipelineSettings, profiling_args_ns: argparse.Namespac
         drop_small_shards=settings.drop_small_shards,
         max_tars_per_part=settings.max_tars_per_part,
         target_tar_size_bytes=target_tar_size_bytes,
+        target_tar_count=settings.target_tar_count,
         min_clips_per_tar=settings.min_clips_per_tar,
         output_path=output_dataset_path,
         output_s3_profile_name=settings.common.output_s3_profile_name,
+        output_layout=settings.shard_output_layout,
     )
     logger.info(f"Dropped {num_dropped_samples} samples during sharding process.")
     if len(tasks) == 0:
@@ -427,15 +622,16 @@ def _shard(settings: ShardPipelineSettings, profiling_args_ns: argparse.Namespac
             total_object_size += packet.get_major_size()
         logger.info(f"Total object size: {total_object_size:,} bytes")
 
-    write_shard_summary(
-        output_dataset_path,
-        settings.output_dataset_path,
-        settings.common.output_s3_profile_name,
-        all_bins,
-        settings.max_tars_per_part,
-        output_packets,
-        perf_profile=settings.common.perf_profile,
-    )
+    if settings.shard_output_layout == "binned":
+        write_shard_summary(
+            output_dataset_path,
+            settings.output_dataset_path,
+            settings.common.output_s3_profile_name,
+            all_bins,
+            settings.max_tars_per_part,
+            output_packets,
+            perf_profile=settings.common.perf_profile,
+        )
 
     elapsed_time = (time.time() - start_time) / 60
     logger.info(f"Embedding-Shard-Webdataset pipeline completed in {elapsed_time:.2f} minutes")
