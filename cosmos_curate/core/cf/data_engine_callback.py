@@ -17,11 +17,37 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
+from typing import Any
 
 import requests
 from loguru import logger
 
 from cosmos_curate.core.cf.data_engine_adapter import DataEngineRequest
+from cosmos_curate.core.utils.infra.logging_sdk import get_logging_client
+
+
+def log_data_engine_event(level: str, event: str, request: DataEngineRequest, **fields: object) -> None:
+    """Write a structured Data Engine business event to the logging SDK."""
+
+    client = get_logging_client(enable_loki=True)
+    if client is None:
+        return
+
+    payload = {
+        "pipeline_id": request.pipeline_id,
+        "pipeline_task_id": request.pipeline_task_id,
+        "target_dataset_id": request.args.target_dataset_id,
+        "output_uri": request.args.output_uri,
+        "source_count": len(request.args.source_uris),
+        **fields,
+    }
+
+    try:
+        log_fn: Any = getattr(client, level, None) or client.info
+        log_fn(event, **payload)
+    except Exception:
+        return
 
 
 def build_callback_payload(
@@ -70,6 +96,29 @@ def build_accepted_response(request: DataEngineRequest) -> dict[str, object]:
     }
 
 
+def build_invalid_request_response(raw: Mapping[str, object], error: str) -> dict[str, object]:
+    """Build a synchronous invalid-request response for malformed Data Engine requests."""
+
+    args_raw = raw.get("args")
+    args = args_raw if isinstance(args_raw, Mapping) else {}
+
+    def optional_str(source: Mapping[str, object], key: str) -> str:
+        value = source.get(key)
+        return value if isinstance(value, str) else ""
+
+    return {
+        "code": -1,
+        "message": "invalid request",
+        "data": {
+            "pipeline_id": optional_str(raw, "pipeline_id"),
+            "pipeline_task_id": optional_str(raw, "pipeline_task_id"),
+            "target_dataset_id": optional_str(args, "target_dataset_id"),
+            "error": error,
+            "error_type": "invalid_request",
+        },
+    }
+
+
 def send_callback(
     request: DataEngineRequest,
     *,
@@ -93,6 +142,33 @@ def send_callback(
         total_videos=total_videos,
         success_videos=success_videos,
     )
-    logger.info("Sending Data Engine callback to %s: %s", request.args.callback_url, json.dumps(payload))
-    response = requests.post(request.args.callback_url, json=payload, timeout=60)
-    response.raise_for_status()
+    logger.info("Sending Data Engine callback to {}: {}", request.args.callback_url, json.dumps(payload))
+    try:
+        response = requests.post(request.args.callback_url, json=payload, timeout=60)
+        response.raise_for_status()
+    except Exception as exc:
+        log_data_engine_event(
+            "error",
+            "data_engine_callback_failed",
+            request,
+            callback_url=request.args.callback_url,
+            callback_succeeded=succeeded,
+            callback_payload_code=payload["code"],
+            total_videos=total_videos,
+            success_videos=success_videos,
+            error=str(exc),
+            exception_type=type(exc).__name__,
+        )
+        raise
+
+    log_data_engine_event(
+        "info",
+        "data_engine_callback_sent",
+        request,
+        callback_url=request.args.callback_url,
+        callback_succeeded=succeeded,
+        callback_payload_code=payload["code"],
+        callback_status_code=getattr(response, "status_code", None),
+        total_videos=total_videos,
+        success_videos=success_videos,
+    )

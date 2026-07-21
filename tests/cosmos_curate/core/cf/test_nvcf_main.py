@@ -19,7 +19,7 @@ import io
 import itertools
 import json
 import queue
-import tempfile
+import tarfile
 import threading
 import zipfile
 from collections.abc import Iterator
@@ -91,30 +91,61 @@ class TestHelperFunctions:
         """Test _get_progress_file returns correct path."""
         progress_file = nvcf_main._get_progress_file(mock_request_id)
         assert progress_file.name == f"progress_{mock_request_id}.json"
-        assert progress_file.parent == Path(tempfile.gettempdir())
+        assert progress_file.parent == nvcf_main._NVCF_RUNTIME_DIR
 
     def test_get_log_file(self, mock_request_id: str) -> None:
         """Test _get_log_file returns correct path."""
         log_file = nvcf_main._get_log_file(mock_request_id)
         assert log_file.name == f"logs_{mock_request_id}.txt"
-        assert log_file.parent == Path(tempfile.gettempdir())
+        assert log_file.parent == nvcf_main._NVCF_RUNTIME_DIR
 
     def test_get_done_file(self, mock_request_id: str) -> None:
         """Test _get_done_file returns correct path."""
         done_file = nvcf_main._get_done_file(mock_request_id)
         assert done_file.name == f"done_{mock_request_id}.txt"
-        assert done_file.parent == Path(tempfile.gettempdir())
+        assert done_file.parent == nvcf_main._NVCF_RUNTIME_DIR
 
     def test_get_failed_file(self, mock_request_id: str) -> None:
         """Test _get_failed_file returns correct path."""
         failed_file = nvcf_main._get_failed_file(mock_request_id)
         assert failed_file.name == f"failed_{mock_request_id}.txt"
-        assert failed_file.parent == Path(tempfile.gettempdir())
+        assert failed_file.parent == nvcf_main._NVCF_RUNTIME_DIR
 
     def test_value_error(self) -> None:
         """Test _value_error raises ValueError."""
         with pytest.raises(ValueError, match="test error"):
             nvcf_main._value_error("test error")
+
+    def test_count_data_engine_success_videos_prefers_package_source_videos(self, tmp_path: Path) -> None:
+        """Test Data Engine success count uses package output source videos when available."""
+        package_dir = tmp_path / "temp_output" / "task_0"
+        package_dir.mkdir(parents=True)
+        (package_dir / "package_output.json").write_text(
+            json.dumps(
+                [
+                    {"id": "clip-a1", "source_video": "s3://bucket/a.mp4"},
+                    {"id": "clip-a2", "source_video": "s3://bucket/a.mp4"},
+                    {"id": "clip-b1", "source_video": "s3://bucket/b.mp4"},
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        with patch("cosmos_curate.core.cf.nvcf_main._resolve_kemi_dp_root", return_value=tmp_path):
+            count = nvcf_main._count_data_engine_success_videos(argparse.Namespace(OUTPUT_PREFIX="task"))
+
+        assert count == 2
+
+    def test_count_data_engine_success_videos_falls_back_to_summary(self, tmp_path: Path) -> None:
+        """Test Data Engine success count still supports the existing summary path."""
+        output_dir = tmp_path / "cosmos_curate_local_workspace" / "task_0"
+        output_dir.mkdir(parents=True)
+        (output_dir / "summary.json").write_text(json.dumps({"num_processed_videos": 3}), encoding="utf-8")
+
+        with patch("cosmos_curate.core.cf.nvcf_main._resolve_kemi_dp_root", return_value=tmp_path):
+            count = nvcf_main._count_data_engine_success_videos(argparse.Namespace(OUTPUT_PREFIX="task"))
+
+        assert count == 3
 
 
 class TestRequestStatus:
@@ -713,13 +744,14 @@ class TestFastAPIEndpoints:
                 "cosmos_curate.core.cf.nvcf_main._start_data_engine_pipeline_thread",
                 side_effect=fake_start_background,
             ):
-                with patch("cosmos_curate.core.cf.nvcf_main.execute_pipeline") as mock_execute:
-                    with patch("cosmos_curate.core.cf.nvcf_main.send_callback") as mock_send_callback:
-                        response = test_client.post(
-                            "/v1/run_pipeline",
-                            headers={"NVCF-REQID": mock_request_id},
-                            json=payload,
-                        )
+                with patch("cosmos_curate.core.cf.nvcf_main.log_data_engine_event") as mock_log_event:
+                    with patch("cosmos_curate.core.cf.nvcf_main.execute_pipeline") as mock_execute:
+                        with patch("cosmos_curate.core.cf.nvcf_main.send_callback") as mock_send_callback:
+                            response = test_client.post(
+                                "/v1/run_pipeline",
+                                headers={"NVCF-REQID": mock_request_id},
+                                json=payload,
+                            )
 
         assert response.status_code == HTTP_OK
         assert response.json() == {
@@ -744,6 +776,13 @@ class TestFastAPIEndpoints:
         assert json.loads(input_path.read_text(encoding="utf-8")) == payload["args"]["source_uris"]
         mock_execute.assert_not_called()
         mock_send_callback.assert_not_called()
+        mock_log_event.assert_called_once()
+        assert mock_log_event.call_args.args[:2] == ("info", "data_engine_request_accepted")
+        assert mock_log_event.call_args.kwargs == {
+            "request_id": mock_request_id,
+            "tar_count": 3,
+            "callback_url": "http://127.0.0.1:19090/datasets/process/callback",
+        }
 
     def test_run_pipeline_data_engine_accepts_dynamic_pack_pipeline_name(
         self,
@@ -766,15 +805,18 @@ class TestFastAPIEndpoints:
 
         with patch("cosmos_curate.core.cf.nvcf_main._resolve_kemi_dp_root", return_value=tmp_path):
             with patch("cosmos_curate.core.cf.nvcf_main._start_data_engine_pipeline_thread") as mock_start:
-                response = test_client.post(
-                    "/v1/run_pipeline",
-                    headers={"NVCF-REQID": mock_request_id},
-                    json=payload,
-                )
+                with patch("cosmos_curate.core.cf.nvcf_main.log_data_engine_event") as mock_log_event:
+                    response = test_client.post(
+                        "/v1/run_pipeline",
+                        headers={"NVCF-REQID": mock_request_id},
+                        json=payload,
+                    )
 
         assert response.status_code == HTTP_OK
         assert response.json()["message"] == "accepted"
         mock_start.assert_called_once()
+        mock_log_event.assert_called_once()
+        assert mock_log_event.call_args.args[:2] == ("info", "data_engine_request_accepted")
 
     def test_run_data_engine_pipeline_background_sends_success_callback(self) -> None:
         """Test the Data Engine background runner executes the shell workflow and sends callback."""
@@ -795,6 +837,7 @@ class TestFastAPIEndpoints:
                     "callback_url": "http://127.0.0.1:19090/datasets/process/callback",
                     "target_dataset_id": "dataset-789",
                     "tar_count": 1,
+                    "probe_manifest_only": False,
                 },
             }
         )
@@ -805,8 +848,9 @@ class TestFastAPIEndpoints:
                 with patch("cosmos_curate.core.cf.nvcf_main.handle_presigned_urls", side_effect=lambda pipeline_type, args: args):
                     with patch("cosmos_curate.core.cf.nvcf_main.execute_pipeline") as mock_execute:
                         with patch("cosmos_curate.core.cf.nvcf_main._count_data_engine_success_videos", return_value=1):
-                            with patch("cosmos_curate.core.cf.nvcf_main.send_callback") as mock_send_callback:
-                                nvcf_main._run_data_engine_pipeline_background("req-1", request, pipeline_args)
+                            with patch("cosmos_curate.core.cf.nvcf_main.log_data_engine_event") as mock_log_event:
+                                with patch("cosmos_curate.core.cf.nvcf_main.send_callback") as mock_send_callback:
+                                    nvcf_main._run_data_engine_pipeline_background("req-1", request, pipeline_args)
 
         mock_execute.assert_called_once()
         called_args = mock_execute.call_args.args
@@ -814,6 +858,127 @@ class TestFastAPIEndpoints:
         assert called_args[2] == "req-1"
         assert called_args[3] is pipeline_args
         mock_send_callback.assert_called_once_with(request, succeeded=True, total_videos=1, success_videos=1)
+        mock_log_event.assert_called_once()
+        assert mock_log_event.call_args.args[:2] == ("info", "data_engine_pipeline_completed")
+        assert mock_log_event.call_args.kwargs == {
+            "request_id": "req-1",
+            "total_videos": 1,
+            "success_videos": 1,
+        }
+        progress_thread.join.assert_called_once()
+        manager.shutdown.assert_called_once()
+
+    def test_run_data_engine_probe_manifest_only_downloads_and_writes_tar_manifest(self, tmp_path: Path) -> None:
+        """Test the lightweight Data Engine path packages downloaded bytes and metadata."""
+        request = nvcf_main.parse_data_engine_request(
+            {
+                "pipeline": "pack_dataset_tars",
+                "pipeline_id": "pipeline-123",
+                "pipeline_task_id": "task-456",
+                "args": {
+                    "source_uris": ["https://data-engine-test.tos/videos/input_a.mp4"],
+                    "output_uri": str(tmp_path),
+                    "callback_url": "http://127.0.0.1:19090/datasets/process/callback",
+                    "target_dataset_id": "dataset-789",
+                    "tar_count": 1,
+                    "probe_manifest_only": True,
+                },
+            }
+        )
+
+        def fake_download(_downloader: object, tasks: list[object]) -> list[object]:
+            for task in tasks:
+                video = task.video
+                video.encoded_data = b"fake-video"
+                video.metadata.width = 640
+                video.metadata.height = 352
+                video.metadata.framerate = 16
+                video.metadata.num_frames = 321
+                video.metadata.duration = 20.0625
+            return tasks
+
+        with patch.object(nvcf_main.VideoDownloader, "process_data", autospec=True, side_effect=fake_download):
+            success_videos = nvcf_main._run_data_engine_probe_manifest_only(request)
+
+        assert success_videos == 1
+        output_tar = tmp_path / "datasets" / "000000.tar"
+        output_manifest = output_tar.with_suffix(".json")
+        sample_tar = tmp_path / "sample_datasets" / "000000.tar"
+        sample_manifest = sample_tar.with_suffix(".json")
+        assert output_tar.is_file()
+        assert output_manifest.is_file()
+        assert sample_tar.is_file()
+        assert sample_manifest.is_file()
+        with tarfile.open(output_tar) as archive:
+            assert archive.getnames() == ["input_a.mp4"]
+        with tarfile.open(sample_tar) as archive:
+            assert archive.getnames() == ["input_a.mp4"]
+
+        manifest = json.loads(output_manifest.read_text(encoding="utf-8"))
+        assert manifest == {
+            "files": [
+                {
+                    "name": "input_a.mp4",
+                    "meta": {
+                        "fps": 16,
+                        "width": 640,
+                        "height": 352,
+                        "num_frames": 321,
+                        "num_bytes": len(b"fake-video"),
+                        "duration_seconds": 20.0625,
+                    },
+                }
+            ]
+        }
+        assert json.loads(sample_manifest.read_text(encoding="utf-8")) == manifest
+
+    def test_run_data_engine_pipeline_background_logs_failure_and_sends_failed_callback(self) -> None:
+        """Test Data Engine background failures are logged and reported via callback."""
+        manager = MagicMock()
+        manager.Value.return_value = SimpleNamespace(value=False)
+        manager.Queue.return_value = queue.Queue()
+        manager.list.return_value = ["success"]
+        progress_thread = MagicMock()
+        stop_event = threading.Event()
+        request = nvcf_main.parse_data_engine_request(
+            {
+                "pipeline": "pack_dataset_tars",
+                "pipeline_id": "pipeline-123",
+                "pipeline_task_id": "task-456",
+                "args": {
+                    "source_uris": ["https://data-engine-test.tos/videos/a.mp4"],
+                    "output_uri": "s3://data-lake/datasets/out-001",
+                    "callback_url": "http://127.0.0.1:19090/datasets/process/callback",
+                    "target_dataset_id": "dataset-789",
+                    "tar_count": 1,
+                    "probe_manifest_only": False,
+                },
+            }
+        )
+        pipeline_args = argparse.Namespace(OUTPUT_PREFIX="task-456")
+
+        with patch("cosmos_curate.core.cf.nvcf_main.Manager", return_value=manager):
+            with patch("cosmos_curate.core.cf.nvcf_main._setup_request", return_value=(progress_thread, stop_event)):
+                with patch("cosmos_curate.core.cf.nvcf_main.handle_presigned_urls", side_effect=lambda pipeline_type, args: args):
+                    with patch(
+                        "cosmos_curate.core.cf.nvcf_main.execute_pipeline",
+                        side_effect=RuntimeError("pipeline down"),
+                    ) as mock_execute:
+                        with patch("cosmos_curate.core.cf.nvcf_main._count_data_engine_success_videos", return_value=0):
+                            with patch("cosmos_curate.core.cf.nvcf_main.log_data_engine_event") as mock_log_event:
+                                with patch("cosmos_curate.core.cf.nvcf_main.send_callback") as mock_send_callback:
+                                    nvcf_main._run_data_engine_pipeline_background("req-1", request, pipeline_args)
+
+        mock_execute.assert_called_once()
+        mock_send_callback.assert_called_once_with(request, succeeded=False, total_videos=1, success_videos=0)
+        mock_log_event.assert_called_once()
+        assert mock_log_event.call_args.args[:2] == ("error", "data_engine_pipeline_failed")
+        assert mock_log_event.call_args.kwargs["request_id"] == "req-1"
+        assert mock_log_event.call_args.kwargs["total_videos"] == 1
+        assert mock_log_event.call_args.kwargs["success_videos"] == 0
+        assert mock_log_event.call_args.kwargs["error"] == "pipeline down"
+        assert mock_log_event.call_args.kwargs["exception_type"] == "RuntimeError"
+        assert "RuntimeError: pipeline down" in mock_log_event.call_args.kwargs["traceback"]
         progress_thread.join.assert_called_once()
         manager.shutdown.assert_called_once()
 

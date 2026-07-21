@@ -26,6 +26,7 @@ from cosmos_curate.core.interfaces.runner_interface import RunnerInterface, Xenn
 from cosmos_curate.core.interfaces.stage_interface import CuratorStage, CuratorStageSpec, PipelineTask
 from cosmos_curate.core.utils.config.operation_context import get_tmp_dir
 from cosmos_curate.core.utils.environment import MODEL_WEIGHTS_PREFIX
+from cosmos_curate.core.utils.infra.failed_items import item_failure_wrapper
 from cosmos_curate.core.utils.infra import hardware_info, ray_cluster_utils
 from cosmos_curate.core.utils.infra.profiling import _apply_profiling_config, profiling_wrapper
 from cosmos_curate.core.utils.misc.stage_replay import StageSaveConfig, should_save_stage, stage_save_wrapper
@@ -267,6 +268,8 @@ def _build_pipeline_stage_specs(
 
     # Apply instrumentation wrapper to every stage (transparent, automatic).
     profiling_config = _apply_profiling_config(args) if args is not None else None
+    for spec in stage_specs:
+        spec.stage = item_failure_wrapper(spec.stage)
     if profiling_config is not None:
         for spec in stage_specs:
             spec.stage = profiling_wrapper(spec.stage, profiling_config)  # type: ignore[arg-type]

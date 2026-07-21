@@ -52,6 +52,7 @@ class OutputConfig:
     caption_models: list[str] = attrs.Factory(list)
     enhanced_caption_models: list[str] = attrs.Factory(list)
     generate_cosmos_predict_dataset: str = "disable"
+    generate_t5_embeddings: bool = True
     vipe_pose_enabled: bool = False
     vipe_fail_policy: str = "warn-only"
     frame_number_output_subdirs: dict[int, str] = attrs.Factory(dict)
@@ -97,6 +98,7 @@ def build_output_stages(config: OutputConfig) -> list[CuratorStage | CuratorStag
                 caption_models=config.caption_models,
                 enhanced_caption_models=config.enhanced_caption_models,
                 generate_cosmos_predict_dataset=config.generate_cosmos_predict_dataset,
+                generate_t5_embeddings=config.generate_t5_embeddings,
                 vipe_pose_enabled=config.vipe_pose_enabled,
                 vipe_fail_policy=config.vipe_fail_policy,
                 frame_number_output_subdirs=config.frame_number_output_subdirs,

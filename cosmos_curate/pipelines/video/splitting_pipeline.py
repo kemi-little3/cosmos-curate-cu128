@@ -106,7 +106,9 @@ from cosmos_curate.pipelines.video.filtering.motion.motion_builders import (
     build_motion_filter_stages,
 )
 from cosmos_curate.pipelines.video.pose.pose_builders import (
+    SkfpPoseConfig,
     VipePoseConfig,
+    build_skfp_pose_stages,
     build_vipe_pose_stages,
 )
 from cosmos_curate.pipelines.video.read_write.input_sources import build_input_data as build_input_data_from_read_write
@@ -817,13 +819,17 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             )
         )
 
-    if not captions_enabled and args.enable_vipe_pose:
+    if args.enable_vipe_pose and args.enable_skfp_pose:
+        msg = "--enable-vipe-pose and --enable-skfp-pose are mutually exclusive"
+        raise ValueError(msg)
+
+    if not captions_enabled and (args.enable_vipe_pose or args.enable_skfp_pose):
         weighted_frame_window_config = _build_weighted_frame_window_config(args)
         window_config = _build_caption_window_config(args, weighted_frame_window_config)
         stages.append(
             ApiPrepStage(
                 window_config=window_config,
-                model_variant="vipe",
+                model_variant="skfp" if args.enable_skfp_pose else "vipe",
                 num_cpus_for_prepare=args.vllm_prepare_num_cpus_per_worker,
                 verbose=args.verbose,
                 log_stats=args.perf_profile,
@@ -914,6 +920,38 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             )
         )
 
+
+    # --- SKFP pose estimation (optional) ---
+    if args.enable_skfp_pose:
+        if not args.skfp_root:
+            msg = "--skfp-root is required when --enable-skfp-pose is set"
+            raise ValueError(msg)
+        if not args.skfp_vipe_python:
+            msg = "--skfp-vipe-python is required when --enable-skfp-pose is set"
+            raise ValueError(msg)
+        if not args.skfp_vipe_adapter_script:
+            msg = "--skfp-vipe-adapter-script is required when --enable-skfp-pose is set"
+            raise ValueError(msg)
+        stages.extend(
+            build_skfp_pose_stages(
+                SkfpPoseConfig(
+                    skfp_root=args.skfp_root,
+                    vipe_python=args.skfp_vipe_python,
+                    vipe_adapter_script=args.skfp_vipe_adapter_script,
+                    vipe_work_root=args.skfp_vipe_work_root,
+                    run_mode=args.skfp_run_mode,
+                    stride=args.skfp_stride,
+                    min_keyframes=args.skfp_min_keyframes,
+                    max_keyframes=args.skfp_max_keyframes,
+                    fail_policy=args.skfp_fail_policy,
+                    num_gpus_per_worker=args.skfp_gpus_per_worker,
+                    num_workers_per_node=args.skfp_num_workers,
+                    verbose=args.verbose,
+                    perf_profile=args.perf_profile,
+                )
+            )
+        )
+
     # --- T5 encoding (optional) ---
     generate_t5_embeddings = os.environ.get("GENERATE_T5_EMBEDDINGS", "1") != "0"
     if args.generate_cosmos_predict_dataset != "disable" and generate_t5_embeddings:
@@ -956,8 +994,9 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
                 caption_models=[args.captioning_algorithm] if captions_enabled else [],
                 enhanced_caption_models=[args.enhance_captions_lm_variant] if captions_enabled and args.enhance_captions else [],
                 generate_cosmos_predict_dataset=args.generate_cosmos_predict_dataset,
-                vipe_pose_enabled=args.enable_vipe_pose,
-                vipe_fail_policy=args.vipe_fail_policy,
+                generate_t5_embeddings=generate_t5_embeddings,
+                vipe_pose_enabled=args.enable_vipe_pose or args.enable_skfp_pose,
+                vipe_fail_policy=args.skfp_fail_policy if args.enable_skfp_pose else args.vipe_fail_policy,
                 frame_number_output_subdirs=weighted_frame_output_subdirs,
                 num_workers_per_node=args.num_clip_writer_workers_per_node,
                 verbose=args.verbose,
@@ -1248,6 +1287,12 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         help="Run ViPE pose estimation for each Cosmos-Predict window and write pose files into the dataset.",
     )
     parser.add_argument(
+        "--enable-skfp-pose",
+        action="store_true",
+        default=False,
+        help="Run SparseKeyframePose estimation for Cosmos-Predict windows. Disabled by default.",
+    )
+    parser.add_argument(
         "--vipe-python",
         type=str,
         default=None,
@@ -1267,13 +1312,11 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
     )
     parser.add_argument(
         "--vipe-run-mode",
-        choices=["subprocess-window", "resident-window", "resident-clip"],
-        default="subprocess-window",
+        choices=["resident-window", "resident-clip"],
+        default="resident-clip",
         help=(
-            "ViPE execution strategy: subprocess-window is the baseline that starts "
-            "run_adapter.py for each window; resident-window keeps one external ViPE "
-            "worker alive but still runs each window independently; resident-clip runs "
-            "the transcoded clip once and slices pose outputs by window."
+            "ViPE execution strategy. resident-window runs each window independently; "
+            "resident-clip runs the transcoded clip once and slices pose outputs by window."
         ),
     )
     parser.add_argument(
@@ -1298,6 +1341,75 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
             "Set > 0 to bypass the autoscaler speed-estimation gate, "
             "which stalls when individual ViPE tasks are slow (>3 min)."
         ),
+    )
+    parser.add_argument(
+        "--skfp-run-mode",
+        choices=["resident-window", "resident-clip"],
+        default="resident-window",
+        help=(
+            "SKFP execution strategy: resident-window runs each window independently; "
+            "resident-clip runs each clip once and slices pose outputs by window."
+        ),
+    )
+    parser.add_argument(
+        "--skfp-root",
+        type=str,
+        default=None,
+        help="Path to the SparseKeyframePose project root.",
+    )
+    parser.add_argument(
+        "--skfp-stride",
+        type=int,
+        default=32,
+        help="Frame stride for uniform SKFP keyframe selection.",
+    )
+    parser.add_argument(
+        "--skfp-min-keyframes",
+        type=int,
+        default=3,
+        help="Minimum number of SKFP keyframes per input video/window.",
+    )
+    parser.add_argument(
+        "--skfp-max-keyframes",
+        type=int,
+        default=0,
+        help="Maximum number of SKFP keyframes per input video/window. 0 keeps all stride-selected keyframes.",
+    )
+    parser.add_argument(
+        "--skfp-vipe-python",
+        type=str,
+        default=None,
+        help="Python interpreter used by SKFP's ViPE keyframe estimator.",
+    )
+    parser.add_argument(
+        "--skfp-vipe-adapter-script",
+        type=str,
+        default=None,
+        help="Path to the ViPE adapter dispatcher used by SKFP's ViPE keyframe estimator.",
+    )
+    parser.add_argument(
+        "--skfp-vipe-work-root",
+        type=str,
+        default="/mlp-01/duanmengxuan/data_pipeline/tmp/skfp_pipeline_vipe_runs",
+        help="Persistent work root for SKFP's staged ViPE keyframe jobs.",
+    )
+    parser.add_argument(
+        "--skfp-fail-policy",
+        choices=["warn-only", "skip-window"],
+        default="warn-only",
+        help="How to handle windows whose SKFP pose estimation fails.",
+    )
+    parser.add_argument(
+        "--skfp-gpus-per-worker",
+        type=float,
+        default=1.0,
+        help="Number of Ray GPUs to reserve for each resident SKFP pose worker.",
+    )
+    parser.add_argument(
+        "--skfp-num-workers",
+        type=int,
+        default=0,
+        help="Fixed number of resident SKFP pose workers per node. 0 uses xenna autoscaling.",
     )
     parser.add_argument(
         "--no-write-all-caption-json",

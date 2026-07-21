@@ -287,6 +287,13 @@ class DownloadPackUpload(CuratorStage):
     def _download_clips(self, task: ShardPipeTask) -> None:
         for clip in task.samples:
             with self._timer.time_process():
+                if clip.encoded_data:
+                    if self._verbose:
+                        logger.info(
+                            f"Reusing preloaded {clip.clip_location}: size={clip.encoded_data.nbytes:,}Byte"
+                        )
+                    continue
+
                 try:
                     if isinstance(clip.clip_location, pathlib.Path):
                         with clip.clip_location.open("rb") as fp:
@@ -334,7 +341,49 @@ class DownloadPackUpload(CuratorStage):
         return storage_utils.get_full_path(output_json)
 
     def _write_video_manifest(self, task: ShardPipeTask) -> None:
-        manifest = {"files": [{"name": f"{clip.uuid}.mp4"} for clip in task.samples]}
+        files = []
+        for clip in task.samples:
+            metadata = clip.clip_metadata
+            name = str(metadata.get("manifest_name") or f"{clip.uuid}.mp4")
+            fps = (
+                metadata.get("fps")
+                if metadata.get("fps") is not None
+                else metadata.get("framerate", clip.framerate)
+            )
+            num_frames = (
+                metadata.get("num_frames")
+                if metadata.get("num_frames") is not None
+                else metadata.get("frame_num", clip.num_frames)
+            )
+            duration_seconds = None
+            raw_duration_seconds = metadata.get("duration_seconds")
+            try:
+                duration_seconds = (
+                    float(raw_duration_seconds)
+                    if raw_duration_seconds is not None
+                    else float(num_frames) / float(fps)
+                )
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+
+            meta: dict[str, object] = {
+                "fps": fps,
+                "width": metadata.get("width", clip.width),
+                "height": metadata.get("height", clip.height),
+                "num_frames": num_frames,
+                "num_bytes": metadata.get("num_bytes", clip.num_bytes),
+            }
+            if duration_seconds is not None:
+                meta["duration_seconds"] = duration_seconds
+
+            files.append(
+                {
+                    "name": name,
+                    "meta": meta,
+                }
+            )
+
+        manifest = {"files": files}
         manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
         manifest_path = self._get_manifest_path(task.output_tar_video)
         write_bytes(

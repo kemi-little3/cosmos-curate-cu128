@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -33,6 +34,7 @@ class DataEngineArgs:
     callback_url: str
     target_dataset_id: str
     tar_count: int = 1
+    probe_manifest_only: bool = False
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -91,6 +93,30 @@ def _optional_positive_int(raw: Mapping[str, object], key: str, default: int) ->
     return parsed
 
 
+def _coerce_bool(value: object, key: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y"}:
+            return True
+        if normalized in {"0", "false", "no", "n"}:
+            return False
+    msg = f"Invalid boolean field: {key}"
+    raise ValueError(msg)
+
+
+def _optional_bool(raw: Mapping[str, object], key: str, default: bool = False) -> bool:
+    return _coerce_bool(raw.get(key, default), key)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return _coerce_bool(value, name)
+
+
 def parse_data_engine_request(raw: Mapping[str, object]) -> DataEngineRequest:
     """Validate and normalize a Data Engine request body."""
 
@@ -109,6 +135,11 @@ def parse_data_engine_request(raw: Mapping[str, object]) -> DataEngineRequest:
             callback_url=_require_str(args_raw, "callback_url"),
             target_dataset_id=_require_str(args_raw, "target_dataset_id"),
             tar_count=_optional_positive_int(args_raw, "tar_count", 1),
+            probe_manifest_only=_optional_bool(
+                args_raw,
+                "probe_manifest_only",
+                _env_bool("DATA_ENGINE_PROBE_MANIFEST_ONLY_DEFAULT", False),
+            ),
         ),
     )
 
@@ -140,9 +171,14 @@ def build_kemi_workflow_shell_args(
     return argparse.Namespace(
         OUTPUT_PREFIX=_safe_path_component(request.pipeline_task_id),
         RAW_INPUT_VIDEO_LIST_JSON=str(input_json_path),
-        BATCH_SIZE="0",
+        BATCH_SIZE="400",
         RUN_SHARD="1",
         SHARD_OUTPUT_DATASET_PATH=request.args.output_uri,
         SHARD_TARGET_TAR_COUNT=str(request.args.tar_count),
         GENERATE_T5_EMBEDDINGS="0",
+        DATA_ENGINE_PIPELINE_ID=request.pipeline_id,
+        DATA_ENGINE_PIPELINE_TASK_ID=request.pipeline_task_id,
+        DATA_ENGINE_TARGET_DATASET_ID=request.args.target_dataset_id,
+        DATA_ENGINE_OUTPUT_URI=request.args.output_uri,
+        DATA_ENGINE_SOURCE_COUNT=str(len(request.args.source_uris)),
     )

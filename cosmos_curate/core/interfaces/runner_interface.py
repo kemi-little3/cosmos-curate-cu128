@@ -23,6 +23,7 @@ from loguru import logger
 
 from cosmos_curate.core.interfaces.stage_interface import CuratorStageSpec, PipelineTask
 from cosmos_curate.core.utils.infra import ray_cluster_utils
+from cosmos_xenna.pipelines.private import resources as xenna_resources
 from cosmos_xenna.pipelines.private.pipelines import run_pipeline as xenna_run_pipeline
 from cosmos_xenna.pipelines.private.specs import (
     PipelineConfig,
@@ -32,6 +33,36 @@ from cosmos_xenna.pipelines.private.specs import (
 from cosmos_xenna.utils.verbosity import VerbosityLevel
 
 T = TypeVar("T", bound=PipelineTask)
+
+
+def _patch_xenna_gpu_resource_discovery() -> None:
+    """Allow Xenna to model Ray GPUs when CUDA visibility is hidden from probe tasks.
+
+    Xenna builds its ClusterResources by running a CPU-only Ray task on each node and
+    querying NVML inside that task. Some Ray versions hide CUDA_VISIBLE_DEVICES for
+    num_gpus=0 tasks, so NVML probing returns no visible GPUs even when Ray reports
+    GPU resources for the node. In that case, synthesize GPU identities from Ray's
+    reported GPU count so Xenna's scheduler sees the same GPU capacity that Ray does.
+    """
+    if getattr(xenna_resources, "_COSMOS_CURATE_GPU_DISCOVERY_PATCHED", False):
+        return
+
+    original_get_gpus = xenna_resources._get_gpus
+
+    def _get_gpus_with_ray_fallback(info_from_ray, info_from_node):  # type: ignore[no-untyped-def]
+        detected_gpus = original_get_gpus(info_from_ray, info_from_node)
+        if detected_gpus:
+            return detected_gpus
+        ray_gpu_count = info_from_ray.gpus
+        if ray_gpu_count is None or ray_gpu_count <= 0:
+            return detected_gpus
+        return [
+            xenna_resources.GpuInfo(index=index, name="ray-reported-gpu", uuid_=None)
+            for index in range(int(ray_gpu_count))
+        ]
+
+    xenna_resources._get_gpus = _get_gpus_with_ray_fallback
+    xenna_resources._COSMOS_CURATE_GPU_DISCOVERY_PATCHED = True
 
 
 class RunnerInterface(abc.ABC):
@@ -168,6 +199,7 @@ class XennaRunner(RunnerInterface):
             logger.info(
                 f"Running pipeline in {pipeline_config.execution_mode.name} mode with {len(input_tasks)} input tasks"
             )
+            _patch_xenna_gpu_resource_discovery()
             pipeline_spec = PipelineSpec(input_data=input_tasks, stages=stage_specs, config=pipeline_config)
             output_tasks = xenna_run_pipeline(pipeline_spec)
 

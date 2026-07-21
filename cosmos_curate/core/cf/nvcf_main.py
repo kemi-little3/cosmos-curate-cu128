@@ -29,6 +29,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.parse
 import uuid
 import zipfile
 from collections.abc import Callable, MutableSequence
@@ -57,7 +58,12 @@ from cosmos_curate.core.cf.data_engine_adapter import (
     build_kemi_workflow_shell_args,
     parse_data_engine_request,
 )
-from cosmos_curate.core.cf.data_engine_callback import build_accepted_response, send_callback
+from cosmos_curate.core.cf.data_engine_callback import (
+    build_accepted_response,
+    build_invalid_request_response,
+    log_data_engine_event,
+    send_callback,
+)
 from cosmos_curate.core.cf.nvcf_utils import (
     create_s3_profile,
     is_nvcf_container_deployment,
@@ -70,16 +76,34 @@ from cosmos_curate.core.utils.storage.presigned_s3_zip import (
     gather_and_upload_outputs,
     handle_presigned_urls,
 )
+from cosmos_curate.core.utils.storage import storage_utils
 from cosmos_curate.pipelines.video.dedup_pipeline import nvcf_run_semdedup
-from cosmos_curate.pipelines.video.sharding_pipeline import nvcf_run_shard
+from cosmos_curate.pipelines.video.read_write.download_stages import DownloadPackUpload, VideoDownloader
+from cosmos_curate.pipelines.video.sharding_pipeline import _build_flat_sample_task, nvcf_run_shard
 from cosmos_curate.pipelines.video.splitting_pipeline import nvcf_run_split
+from cosmos_curate.pipelines.video.utils.data_model import ClipSample, ShardPipeTask, SplitPipeTask, Video
 
 KEMI_WORKFLOW_PIPELINE = "kemi-workflow"
 KEMI_WORKFLOW_SHELL_PIPELINE = "kemi-workflow-shell"
 
-_LOG_RDWR_LOCK_FILE = pathlib.Path(tempfile.gettempdir()) / "pipeline_status.lock"
-_PIPELINE_LOCK_FILE = pathlib.Path(tempfile.gettempdir()) / "pipeline.lock"
-_PIPELINE_STATUS_FILE = pathlib.Path(tempfile.gettempdir()) / "pipeline_status"
+
+def _resolve_nvcf_runtime_dir() -> pathlib.Path:
+    """Return the shared directory used for NVCF runtime state."""
+    configured_dir = os.environ.get("COSMOS_NVCF_RUNTIME_DIR")
+    if configured_dir:
+        runtime_dir = pathlib.Path(configured_dir).expanduser()
+    elif pathlib.Path("/config/tmp").is_dir():
+        runtime_dir = pathlib.Path("/config/tmp") / f"nvcf-{os.getuid()}"
+    else:
+        runtime_dir = pathlib.Path(tempfile.gettempdir()) / f"cosmos-nvcf-{os.getuid()}"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    return runtime_dir
+
+
+_NVCF_RUNTIME_DIR = _resolve_nvcf_runtime_dir()
+_LOG_RDWR_LOCK_FILE = _NVCF_RUNTIME_DIR / "pipeline_status.lock"
+_PIPELINE_LOCK_FILE = _NVCF_RUNTIME_DIR / "pipeline.lock"
+_PIPELINE_STATUS_FILE = _NVCF_RUNTIME_DIR / "pipeline_status"
 _FORCE_TERMINATE_REQUEST_ID = "12345678-1234-1234-1234-123456789abc"
 
 _RAY_DASHBOARD = f"http://127.0.0.1:{os.getenv('RAY_DASHBOARD_PORT', '8265')}"
@@ -171,19 +195,19 @@ def _get_request_status(req_id: str) -> str:
 
 
 def _get_progress_file(req_id: str) -> pathlib.Path:
-    return pathlib.Path(tempfile.gettempdir()) / f"progress_{req_id}.json"
+    return _NVCF_RUNTIME_DIR / f"progress_{req_id}.json"
 
 
 def _get_log_file(req_id: str) -> pathlib.Path:
-    return pathlib.Path(tempfile.gettempdir()) / f"logs_{req_id}.txt"
+    return _NVCF_RUNTIME_DIR / f"logs_{req_id}.txt"
 
 
 def _get_done_file(req_id: str) -> pathlib.Path:
-    return pathlib.Path(tempfile.gettempdir()) / f"done_{req_id}.txt"
+    return _NVCF_RUNTIME_DIR / f"done_{req_id}.txt"
 
 
 def _get_failed_file(req_id: str) -> pathlib.Path:
-    return pathlib.Path(tempfile.gettempdir()) / f"failed_{req_id}.txt"
+    return _NVCF_RUNTIME_DIR / f"failed_{req_id}.txt"
 
 
 # returns a dict (job_id/submission_id, (type, status, message))
@@ -473,13 +497,13 @@ class PipelineLockMiddleware(BaseHTTPMiddleware):
                     }
                     return JSONResponse(
                         status_code=code,
-                        content={status: msg},
+                        content={status: msg, "error_type": "terminate_failed"} if status == "error" else {status: msg},
                         headers=hdrs,
                     )
                 logger.error("Cannot terminate when missing request id")
                 return JSONResponse(
                     status_code=400,
-                    content={"error": "Missing request id"},
+                    content={"error": "Missing request id", "error_type": "missing_request_id"},
                     media_type="application/json",
                 )
             # status check request
@@ -489,7 +513,7 @@ class PipelineLockMiddleware(BaseHTTPMiddleware):
                 if req_id is None:
                     return JSONResponse(
                         status_code=400,
-                        content={"error": "Missing request ID in headers"},
+                        content={"error": "Missing request ID in headers", "error_type": "missing_request_id"},
                     )
                 # read progress and log files
                 progress_pct, log_lines = _read_progress_and_log_files(req_id)
@@ -519,6 +543,7 @@ class PipelineLockMiddleware(BaseHTTPMiddleware):
                     status_code=429,
                     content={
                         "error": "Pipeline is currently busy. Please try again later.",
+                        "error_type": "pipeline_busy",
                     },
                 )
 
@@ -542,6 +567,7 @@ class PipelineLockMiddleware(BaseHTTPMiddleware):
                     status_code=429,
                     content={
                         "error": "Pipeline is currently busy. Please try again later.",
+                        "error_type": "pipeline_busy",
                     },
                 )
 
@@ -675,7 +701,7 @@ def get_asset_output_path(request: Request) -> str | None:
 
     if output_dir is None or not pathlib.Path(output_dir).exists():
         logger.warning(f"NVCF-LARGE-OUTPUT-DIR {output_dir} does not exist")
-        o_dir = pathlib.Path(tempfile.gettempdir()) / "nvcf_output"
+        o_dir = _NVCF_RUNTIME_DIR / "nvcf_output"
         o_dir.mkdir(parents=True, exist_ok=True)
         output_dir = str(o_dir)
     return output_dir
@@ -703,6 +729,7 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
     data_engine_request = None
     pipeline_type = "unknown"
     upload_pipeline_type = None
+    request_id: str | None = None
 
     try:
         invoke_args = await request.json()
@@ -713,12 +740,26 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
             request_id = str(uuid.uuid4())
 
         if _is_data_engine_pack_pipeline(pipeline_type):
-            data_engine_request = parse_data_engine_request(invoke_args)
+            try:
+                data_engine_request = parse_data_engine_request(invoke_args)
+            except ValueError as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content=build_invalid_request_response(invoke_args, str(exc)),
+                )
             pipeline_args = build_kemi_workflow_shell_args(
                 data_engine_request,
                 workspace_prefix=_resolve_kemi_dp_root(),
             )
             _start_data_engine_pipeline_thread(request_id, data_engine_request, pipeline_args)
+            log_data_engine_event(
+                "info",
+                "data_engine_request_accepted",
+                data_engine_request,
+                request_id=request_id,
+                tar_count=data_engine_request.args.tar_count,
+                callback_url=data_engine_request.args.callback_url,
+            )
             return JSONResponse(
                 status_code=200,
                 content=build_accepted_response(data_engine_request),
@@ -746,7 +787,7 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
         logger.info(f"Request ID: {request_id}")
         output_dir = nvcf_output_dir if using_nvcf_status["get_req_sts"] else None
         if output_dir is None:
-            output_dir = tempfile.gettempdir()  # do not leave as None
+            output_dir = str(_NVCF_RUNTIME_DIR)  # do not leave as None
 
         progress_thread, stop_event = _setup_request(
             output_dir,
@@ -780,7 +821,7 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
         logger.info(f"Launching pipeline {pipeline_type} with args: {pipeline_args}")
         if pipeline_type == "split":
             # Keep explicit split as the legacy/debug split endpoint. This path
-            # intentionally uses NVCF asset output defaults such as /tmp/nvcf_output.
+            # intentionally uses the NVCF runtime asset output default.
             if not getattr(pipeline_args, "input_presigned_s3_url", None) and input_assets_present(request):
                 pipeline_args.input_video_path = get_asset_input_dir(request)
 
@@ -815,7 +856,7 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
             )
         elif pipeline_type == KEMI_WORKFLOW_SHELL_PIPELINE:
             # Kemi shell owns output path defaults. Do not inject NVCF's
-            # /tmp/nvcf_output asset path here, or the worker cannot create
+            # the NVCF runtime asset path here, or the worker cannot create
             # per-prefix/per-batch workspace outputs.
             if not getattr(pipeline_args, "input_presigned_s3_url", None) and input_assets_present(request):
                 pipeline_args.input_video_path = get_asset_input_dir(request)
@@ -920,7 +961,7 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
         # flatten it, json.dumps is bad, NVCF adds its own encoding, too many \\\\\
         error_details = "\n".join([f"{k}: {v}" for k, v in error_dict.items()])
         logger.error(f"Error in pipeline: {error_details}")
-        return JSONResponse(status_code=500, content={"error": error_details})
+        return JSONResponse(status_code=500, content={"error": error_details, "error_type": type(e).__name__})
     finally:
         logger.info("Cleaning up after finishing the invoke")
         if stop_event and not stop_event.is_set():
@@ -969,6 +1010,30 @@ def _read_num_processed_videos(summary_path: pathlib.Path) -> int | None:
     return parsed if parsed >= 0 else None
 
 
+def _read_package_success_videos(package_json: pathlib.Path) -> int | None:
+    try:
+        data = json.loads(package_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(f"Failed to read Data Engine package output {package_json}: {exc}")
+        return None
+
+    if not isinstance(data, list):
+        return None
+
+    source_videos: set[str] = set()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        for key in ("source_video", "input_video", "video_uri"):
+            value = item.get(key)
+            if isinstance(value, str) and value:
+                source_videos.add(value)
+                break
+    if source_videos:
+        return len(source_videos)
+    return None
+
+
 def _count_data_engine_success_videos(pipeline_args: argparse.Namespace) -> int:
     output_subdir = _get_namespace_value(pipeline_args, "OUTPUT_SUBDIR", "output_subdir")
     if output_subdir is None:
@@ -980,6 +1045,15 @@ def _count_data_engine_success_videos(pipeline_args: argparse.Namespace) -> int:
             "0",
         )
         output_subdir = f"{output_prefix}_{worker_rank}"
+
+    package_output_dir = _get_namespace_value(pipeline_args, "PACKAGE_OUTPUT_DIR", "package_output_dir")
+    if package_output_dir is None:
+        package_output_dir = _resolve_kemi_dp_root() / "temp_output" / str(output_subdir)
+    package_json = pathlib.Path(package_output_dir) / "package_output.json"
+    if package_json.is_file():
+        package_count = _read_package_success_videos(package_json)
+        if package_count is not None:
+            return package_count
 
     output_root = _resolve_kemi_dp_root() / "cosmos_curate_local_workspace" / str(output_subdir)
     top_summary = output_root / "summary.json"
@@ -994,6 +1068,149 @@ def _count_data_engine_success_videos(pipeline_args: argparse.Namespace) -> int:
             total += count
             found_summary = True
     return total if found_summary else 0
+
+
+def _url_basename(uri: str, idx: int) -> str:
+    parsed = urllib.parse.urlparse(uri)
+    basename = pathlib.PurePosixPath(urllib.parse.unquote(parsed.path)).name
+    return basename or f"source_{idx:06d}.mp4"
+
+
+def _video_to_source_clip(video: Video, uri: str, idx: int) -> ClipSample:
+    metadata = video.metadata
+    missing = [
+        name
+        for name, value in (
+            ("width", metadata.width),
+            ("height", metadata.height),
+            ("framerate", metadata.framerate),
+            ("num_frames", metadata.num_frames),
+        )
+        if value is None
+    ]
+    if not video.encoded_data or missing:
+        details = f"missing metadata: {', '.join(missing)}" if missing else "video bytes are empty"
+        msg = f"VideoDownloader failed for source_uris[{idx}]={uri}: {details}"
+        raise RuntimeError(msg)
+    if "download" in video.errors or "remux" in video.errors:
+        msg = f"VideoDownloader failed for source_uris[{idx}]={uri}: {video.errors}"
+        raise RuntimeError(msg)
+
+    assert metadata.width is not None
+    assert metadata.height is not None
+    assert metadata.framerate is not None
+    assert metadata.num_frames is not None
+    fps = float(metadata.framerate)
+    if fps <= 0:
+        msg = f"VideoDownloader returned invalid fps for source_uris[{idx}]={uri}: {fps}"
+        raise RuntimeError(msg)
+
+    duration_seconds = metadata.duration
+    if duration_seconds is None:
+        duration_seconds = float(metadata.num_frames) / fps
+    basename = _url_basename(uri, idx)
+    sample_uuid = _safe_shell_component(pathlib.PurePosixPath(basename).stem or f"source_{idx:06d}")
+    fps_value: int | float = int(fps) if fps.is_integer() else round(fps, 6)
+    num_bytes = video.encoded_data.nbytes
+
+    return ClipSample(
+        uuid=sample_uuid,
+        width=metadata.width,
+        height=metadata.height,
+        num_frames=metadata.num_frames,
+        framerate=fps,
+        num_bytes=num_bytes,
+        clip_location=video.input_video,
+        clip_metadata={
+            "manifest_name": basename,
+            "width": metadata.width,
+            "height": metadata.height,
+            "fps": fps_value,
+            "framerate": fps_value,
+            "num_frames": metadata.num_frames,
+            "num_bytes": num_bytes,
+            "duration_seconds": duration_seconds,
+        },
+        encoded_data=video.encoded_data,
+    )
+
+
+def _partition_source_clips(samples: list[ClipSample], target_tar_count: int) -> list[list[ClipSample]]:
+    part_count = min(target_tar_count, len(samples))
+    base_size, remainder = divmod(len(samples), part_count)
+    parts: list[list[ClipSample]] = []
+    start = 0
+    for part_num in range(part_count):
+        part_size = base_size + (1 if part_num < remainder else 0)
+        parts.append(samples[start : start + part_size])
+        start += part_size
+    return parts
+
+
+def _run_data_engine_probe_manifest_only(data_engine_request: DataEngineRequest) -> int:
+    """Download and package source videos without running GPU pipeline stages."""
+    source_uris = data_engine_request.args.source_uris
+    input_path = next((uri for uri in source_uris if storage_utils.is_remote_path(uri)), "")
+    split_tasks = [
+        SplitPipeTask(
+            session_id=uri,
+            video=Video(
+                input_video=(
+                    uri
+                    if urllib.parse.urlparse(uri).scheme in {"http", "https"}
+                    else storage_utils.get_full_path(uri)
+                )
+            ),
+        )
+        for uri in source_uris
+    ]
+    downloader = VideoDownloader(input_path=input_path, input_s3_profile_name="default")
+    downloader.stage_setup()
+    downloaded_tasks = downloader.process_data(split_tasks)
+    if downloaded_tasks is None:
+        msg = "VideoDownloader returned no tasks for Data Engine source packaging"
+        raise RuntimeError(msg)
+
+    samples = [
+        _video_to_source_clip(task.video, uri, idx)
+        for idx, (task, uri) in enumerate(zip(downloaded_tasks, source_uris, strict=True))
+    ]
+    dataset_path = storage_utils.get_full_path(data_engine_request.args.output_uri, "datasets")
+    shard_tasks = []
+    for part_num, part_samples in enumerate(
+        _partition_source_clips(samples, data_engine_request.args.tar_count)
+    ):
+        tar_name = f"{part_num:06d}.tar"
+        shard_tasks.append(
+            ShardPipeTask(
+                bin_path=str(dataset_path),
+                part_num=part_num,
+                samples=part_samples,
+                output_tar_video=storage_utils.get_full_path(dataset_path, tar_name),
+                output_tar_metas=storage_utils.get_full_path(
+                    data_engine_request.args.output_uri, "metas", tar_name
+                ),
+                output_tar_t5_xxl=storage_utils.get_full_path(
+                    data_engine_request.args.output_uri, "t5_xxl", tar_name
+                ),
+                key_count=0,
+                write_auxiliary_tars=False,
+            )
+        )
+
+    sample_task = _build_flat_sample_task(samples, output_path=data_engine_request.args.output_uri)
+    if sample_task is not None:
+        shard_tasks.append(sample_task)
+
+    stage = DownloadPackUpload(
+        input_path=input_path,
+        output_path=data_engine_request.args.output_uri,
+        input_s3_profile_name="default",
+        output_s3_profile_name="default",
+    )
+    stage.stage_setup()
+    stage.process_data(shard_tasks)
+    return len(samples)
 
 
 def _run_data_engine_pipeline_background(
@@ -1012,7 +1229,7 @@ def _run_data_engine_pipeline_background(
     success_videos = 0
 
     try:
-        output_dir = tempfile.gettempdir()
+        output_dir = str(_NVCF_RUNTIME_DIR)
         manager = Manager()
         ipc_status: Any = manager.Value(ctypes.c_bool, value=False)
         log_queue = cast("multiprocessing.Queue", manager.Queue())  # type: ignore[type-arg]
@@ -1033,26 +1250,35 @@ def _run_data_engine_pipeline_background(
             did_init_s3_profile = create_s3_profile(pipeline_args.s3_config)
             pipeline_args.s3_config = "REDACTED"
 
-        logger.info(f"Launching Data Engine pipeline {KEMI_WORKFLOW_SHELL_PIPELINE} with args: {pipeline_args}")
-        execute_pipeline(
-            _run_in_process,
-            nvcf_run_kemi_workflow_shell,
-            request_id,
-            pipeline_args,
-            log_queue,
-            ipc_status,
-            stop_event,
-        )
-        success_videos = _count_data_engine_success_videos(pipeline_args)
-        send_callback(
-            data_engine_request,
-            succeeded=True,
-            total_videos=total_videos,
-            success_videos=success_videos,
-        )
+        if data_engine_request.args.probe_manifest_only:
+            logger.info("Launching Data Engine lightweight source-pack path")
+            success_videos = _run_data_engine_probe_manifest_only(data_engine_request)
+        else:
+            logger.info(f"Launching Data Engine pipeline {KEMI_WORKFLOW_SHELL_PIPELINE} with args: {pipeline_args}")
+            execute_pipeline(
+                _run_in_process,
+                nvcf_run_kemi_workflow_shell,
+                request_id,
+                pipeline_args,
+                log_queue,
+                ipc_status,
+                stop_event,
+            )
+            success_videos = _count_data_engine_success_videos(pipeline_args)
     except Exception as exc:  # noqa: BLE001
         logger.exception(f"Data Engine pipeline failed: {exc}")
         success_videos = _count_data_engine_success_videos(pipeline_args)
+        log_data_engine_event(
+            "error",
+            "data_engine_pipeline_failed",
+            data_engine_request,
+            request_id=request_id,
+            total_videos=total_videos,
+            success_videos=success_videos,
+            error=str(exc),
+            exception_type=type(exc).__name__,
+            traceback=traceback.format_exc(),
+        )
         try:
             send_callback(
                 data_engine_request,
@@ -1062,6 +1288,35 @@ def _run_data_engine_pipeline_background(
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to send Data Engine failure callback")
+    else:
+        if success_videos < total_videos:
+            log_data_engine_event(
+                "warning",
+                "data_engine_pipeline_partial",
+                data_engine_request,
+                request_id=request_id,
+                total_videos=total_videos,
+                success_videos=success_videos,
+                failed_videos=total_videos - success_videos,
+            )
+        else:
+            log_data_engine_event(
+                "info",
+                "data_engine_pipeline_completed",
+                data_engine_request,
+                request_id=request_id,
+                total_videos=total_videos,
+                success_videos=success_videos,
+            )
+        try:
+            send_callback(
+                data_engine_request,
+                succeeded=True,
+                total_videos=total_videos,
+                success_videos=success_videos,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to send Data Engine success callback")
     finally:
         if stop_event and not stop_event.is_set():
             stop_event.set()
@@ -1088,7 +1343,7 @@ def _run_in_process(
     for additional info
     """
     # Create the script dynamically
-    sfile = pathlib.Path(tempfile.gettempdir()) / f"{request_id}.py"
+    sfile = _NVCF_RUNTIME_DIR / f"{request_id}.py"
     with sfile.open("w") as sf:
         sf.write(f"""
 import sys
@@ -1295,7 +1550,13 @@ def nvcf_run_kemi_workflow(args: argparse.Namespace) -> None:
         msg = f"kemi workflow script not found: {script_path}"
         raise FileNotFoundError(msg)
 
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as fp:
+    with tempfile.NamedTemporaryFile(
+        "w",
+        suffix=".json",
+        delete=False,
+        encoding="utf-8",
+        dir=_NVCF_RUNTIME_DIR,
+    ) as fp:
         json.dump(vars(args), fp, ensure_ascii=False, indent=2)
         config_path = pathlib.Path(fp.name)
 

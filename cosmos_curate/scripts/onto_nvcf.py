@@ -55,6 +55,22 @@ os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
 REQUIRED_VARS: set[str] = {"NODES_PER_INSTANCE", "POD_NAME", "HEADLESS_SERVICE_NAME"}
 
 
+def _resolve_nvcf_runtime_dir() -> Path:
+    """Return the shared directory used for NVCF runtime state."""
+    configured_dir = os.environ.get("COSMOS_NVCF_RUNTIME_DIR")
+    if configured_dir:
+        runtime_dir = Path(configured_dir).expanduser()
+    elif Path("/config/tmp").is_dir():
+        runtime_dir = Path("/config/tmp") / f"nvcf-{os.getuid()}"
+    else:
+        runtime_dir = Path(tempfile.gettempdir()) / f"cosmos-nvcf-{os.getuid()}"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    return runtime_dir
+
+
+NVCF_RUNTIME_DIR = _resolve_nvcf_runtime_dir()
+
+
 def check_required_vars() -> None:
     """Verify that all required environment variables are set.
 
@@ -393,7 +409,7 @@ def startup(replica: str, head_pod: str) -> dict[str, subprocess.Popen[str] | No
 
             if worker_count == 1 and not ready_set:
                 logger.info("Ray cluster is ready. Setting head node pod status to ready.")
-                Path(f"{tempfile.gettempdir()}/is_ready").touch()
+                (NVCF_RUNTIME_DIR / "is_ready").touch()
                 ready_set = True
 
             if worker_count >= NODES_PER_INSTANCE:

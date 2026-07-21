@@ -54,21 +54,25 @@ def test_vipe_pose_stage_populates_window(monkeypatch, tmp_path) -> None:
     assert window.pose_meta["source_window"]["end_frame"] == 2
 
 
-def test_vipe_pose_builder_selects_run_modes() -> None:
+def test_vipe_pose_builder_uses_resident_clip_only() -> None:
     from cosmos_curate.pipelines.video.pose.pose_builders import VipePoseConfig, build_vipe_pose_stages
-    from cosmos_curate.pipelines.video.pose.vipe_pose_stage import VipePoseStage
     from cosmos_curate.pipelines.video.pose.vipe_pose_stage_resident_clip import VipeResidentClipStage
-    from cosmos_curate.pipelines.video.pose.vipe_pose_stage_resident_window import VipeResidentWindowStage
 
-    modes = {
-        "subprocess-window": VipePoseStage,
-        "resident-window": VipeResidentWindowStage,
-        "resident-clip": VipeResidentClipStage,
-    }
-    for mode, expected_type in modes.items():
-        stages = build_vipe_pose_stages(VipePoseConfig(vipe_python="python", run_mode=mode))
-        stage = stages[0].stage if hasattr(stages[0], "stage") else stages[0]
-        assert isinstance(stage, expected_type)
+    stages = build_vipe_pose_stages(VipePoseConfig(vipe_python="python"))
+    stage = stages[0].stage if hasattr(stages[0], "stage") else stages[0]
+    assert isinstance(stage, VipeResidentClipStage)
+
+    stages = build_vipe_pose_stages(VipePoseConfig(vipe_python="python", run_mode="resident-clip"))
+    stage = stages[0].stage if hasattr(stages[0], "stage") else stages[0]
+    assert isinstance(stage, VipeResidentClipStage)
+
+    for old_mode in ["subprocess-window", "resident-window"]:
+        try:
+            build_vipe_pose_stages(VipePoseConfig(vipe_python="python", run_mode=old_mode))
+        except ValueError as error:
+            assert "resident-clip" in str(error)
+        else:
+            raise AssertionError(f"legacy ViPE mode should be rejected: {old_mode}")
 
 
 def test_vipe_pose_builder_wraps_fixed_worker_count() -> None:
@@ -78,6 +82,47 @@ def test_vipe_pose_builder_wraps_fixed_worker_count() -> None:
     stages = build_vipe_pose_stages(
         VipePoseConfig(
             vipe_python="python",
+            num_workers_per_node=2,
+        )
+    )
+
+    assert len(stages) == 1
+    assert isinstance(stages[0], StageSpec)
+    assert stages[0].num_workers_per_node == 2
+
+
+def test_skfp_pose_builder_selects_resident_modes() -> None:
+    from cosmos_curate.pipelines.video.pose.pose_builders import SkfpPoseConfig, build_skfp_pose_stages
+    from cosmos_curate.pipelines.video.pose.skfp_pose_stage_resident_clip import SkfpResidentClipStage
+    from cosmos_curate.pipelines.video.pose.skfp_pose_stage_resident_window import SkfpResidentWindowStage
+
+    modes = {
+        "resident-window": SkfpResidentWindowStage,
+        "resident-clip": SkfpResidentClipStage,
+    }
+    for mode, expected_type in modes.items():
+        stages = build_skfp_pose_stages(
+            SkfpPoseConfig(
+                skfp_root="/tmp/skfp",
+                vipe_python="python",
+                vipe_adapter_script="adapter.py",
+                run_mode=mode,
+            )
+        )
+        stage = stages[0].stage if hasattr(stages[0], "stage") else stages[0]
+        assert isinstance(stage, expected_type)
+        assert stage.resources.gpus == 1.0
+
+
+def test_skfp_pose_builder_wraps_fixed_worker_count() -> None:
+    from cosmos_curate.pipelines.video.pose.pose_builders import SkfpPoseConfig, build_skfp_pose_stages
+    from cosmos_xenna.pipelines.private.specs import StageSpec
+
+    stages = build_skfp_pose_stages(
+        SkfpPoseConfig(
+            skfp_root="/tmp/skfp",
+            vipe_python="python",
+            vipe_adapter_script="adapter.py",
             run_mode="resident-window",
             num_workers_per_node=2,
         )

@@ -30,9 +30,9 @@
 
 Loki 和 Grafana 地址是：
 
-- Grafana UI: `http://192.168.9.23:13000`
-- Loki push/query API: `http://192.168.9.23:13100`
-- Loki push endpoint: `http://192.168.9.23:13100/loki/api/v1/push`
+- Grafana UI: `http://192.168.9.132:3000`
+- Loki push/query API: `http://192.168.9.132:3100`
+- Loki push endpoint: `http://192.168.9.132:3100/loki/api/v1/push`
 
 Grafana 登录信息：
 
@@ -67,7 +67,7 @@ client = get_client(
         app="darwinmind_data_engine",
         service_name="cosmos_curate",
         enable_loki=True,
-        loki_url="http://192.168.9.23:13100/loki/api/v1/push",
+        loki_url="http://192.168.9.132:3100/loki/api/v1/push",
     )
 )
 
@@ -118,7 +118,7 @@ client.info(
 
 ## 怎么在 Grafana 查
 
-1. 打开 Grafana: `http://192.168.9.23:13000`
+1. 打开 Grafana: `http://192.168.9.132:3000`
 2. 登录 `admin / zjulearning123`
 3. 进入 `Explore`
 4. 选择数据源 `Loki`
@@ -161,4 +161,3 @@ client.info(
 - 先把这份中文文档当作项目内说明
 - 再按原始英文文档核对参数
 - 先接入口日志，再考虑 batch 级别的细日志
-

@@ -26,6 +26,7 @@ def test_parse_data_engine_request_smoke() -> None:
             "callback_url": "http://127.0.0.1:19090/datasets/process/callback",
             "target_dataset_id": "dataset-789",
             "tar_count": 1,
+            "probe_manifest_only": True,
         },
     }
 
@@ -42,6 +43,47 @@ def test_parse_data_engine_request_smoke() -> None:
     assert request.args.callback_url == "http://127.0.0.1:19090/datasets/process/callback"
     assert request.args.target_dataset_id == "dataset-789"
     assert request.args.tar_count == 1
+    assert request.args.probe_manifest_only is True
+
+
+def test_parse_data_engine_request_defaults_probe_manifest_only_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DATA_ENGINE_PROBE_MANIFEST_ONLY_DEFAULT", raising=False)
+    raw = {
+        "pipeline": "pack_dataset_tars",
+        "pipeline_id": "pipeline-123",
+        "pipeline_task_id": "task-456",
+        "args": {
+            "source_uris": ["s3://data-lake/videos/a.mp4"],
+            "output_uri": "s3://data-lake/datasets/out-001",
+            "callback_url": "http://127.0.0.1:19090/datasets/process/callback",
+            "target_dataset_id": "dataset-789",
+        },
+    }
+
+    request = parse_data_engine_request(raw)
+
+    assert request.args.probe_manifest_only is True
+
+
+def test_parse_data_engine_request_can_disable_default_probe_manifest_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATA_ENGINE_PROBE_MANIFEST_ONLY_DEFAULT", "0")
+    raw = {
+        "pipeline": "pack_dataset_tars",
+        "pipeline_id": "pipeline-123",
+        "pipeline_task_id": "task-456",
+        "args": {
+            "source_uris": ["s3://data-lake/videos/a.mp4"],
+            "output_uri": "s3://data-lake/datasets/out-001",
+            "callback_url": "http://127.0.0.1:19090/datasets/process/callback",
+            "target_dataset_id": "dataset-789",
+        },
+    }
+
+    request = parse_data_engine_request(raw)
+
+    assert request.args.probe_manifest_only is False
 
 
 def test_build_callback_payload_smoke() -> None:
@@ -70,6 +112,32 @@ def test_build_callback_payload_smoke() -> None:
     }
 
 
+def test_build_invalid_request_response_includes_error_type() -> None:
+    payload = data_engine_callback.build_invalid_request_response(
+        {
+            "pipeline": "pack_dataset_tars",
+            "pipeline_id": "pipeline-123",
+            "pipeline_task_id": "task-456",
+            "args": {
+                "target_dataset_id": "dataset-789",
+            },
+        },
+        "source_uris is empty",
+    )
+
+    assert payload == {
+        "code": -1,
+        "message": "invalid request",
+        "data": {
+            "pipeline_id": "pipeline-123",
+            "pipeline_task_id": "task-456",
+            "target_dataset_id": "dataset-789",
+            "error": "source_uris is empty",
+            "error_type": "invalid_request",
+        },
+    }
+
+
 def test_build_kemi_workflow_shell_args_writes_pipeline_input(tmp_path: Path) -> None:
     request = parse_data_engine_request(
         {
@@ -92,7 +160,7 @@ def test_build_kemi_workflow_shell_args_writes_pipeline_input(tmp_path: Path) ->
     args = build_kemi_workflow_shell_args(request, workspace_prefix=tmp_path)
 
     assert args.OUTPUT_PREFIX == "task_456"
-    assert args.BATCH_SIZE == "0"
+    assert args.BATCH_SIZE == "400"
     assert args.RUN_SHARD == "1"
     assert args.SHARD_OUTPUT_DATASET_PATH == "s3://data-lake/datasets/out-001"
     assert args.SHARD_TARGET_TAR_COUNT == "1"
@@ -116,7 +184,13 @@ def test_send_callback_smoke(monkeypatch: pytest.MonkeyPatch) -> None:
         recorded["timeout"] = timeout
         return _FakeResponse()
 
+    log_events: list[tuple[str, str, dict[str, object]]] = []
+
+    def fake_log_event(level: str, event: str, request: object, **fields: object) -> None:
+        log_events.append((level, event, fields))
+
     monkeypatch.setattr(data_engine_callback.requests, "post", fake_post)
+    monkeypatch.setattr(data_engine_callback, "log_data_engine_event", fake_log_event)
 
     request = parse_data_engine_request(
         {
@@ -150,3 +224,64 @@ def test_send_callback_smoke(monkeypatch: pytest.MonkeyPatch) -> None:
             "success_videos": 1,
         },
     }
+    assert log_events == [
+        (
+            "info",
+            "data_engine_callback_sent",
+            {
+                "callback_url": "http://127.0.0.1:19090/datasets/process/callback",
+                "callback_succeeded": True,
+                "callback_payload_code": 0,
+                "callback_status_code": None,
+                "total_videos": 1,
+                "success_videos": 1,
+            },
+        )
+    ]
+
+
+def test_send_callback_logs_failure_smoke(monkeypatch: pytest.MonkeyPatch) -> None:
+    log_events: list[tuple[str, str, dict[str, object]]] = []
+
+    def fake_post(url: str, json: dict[str, Any], timeout: int) -> object:
+        raise RuntimeError("callback down")
+
+    def fake_log_event(level: str, event: str, request: object, **fields: object) -> None:
+        log_events.append((level, event, fields))
+
+    monkeypatch.setattr(data_engine_callback.requests, "post", fake_post)
+    monkeypatch.setattr(data_engine_callback, "log_data_engine_event", fake_log_event)
+
+    request = parse_data_engine_request(
+        {
+            "pipeline": "pack_dataset_tars",
+            "pipeline_id": "pipeline-123",
+            "pipeline_task_id": "task-456",
+            "args": {
+                "source_uris": ["s3://data-lake/videos/a.mp4", "s3://data-lake/videos/b.mp4"],
+                "output_uri": "s3://data-lake/datasets/out-001",
+                "callback_url": "http://127.0.0.1:19090/datasets/process/callback",
+                "target_dataset_id": "dataset-789",
+                "tar_count": 1,
+            },
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="callback down"):
+        data_engine_callback.send_callback(request, succeeded=False, total_videos=2, success_videos=1)
+
+    assert log_events == [
+        (
+            "error",
+            "data_engine_callback_failed",
+            {
+                "callback_url": "http://127.0.0.1:19090/datasets/process/callback",
+                "callback_succeeded": False,
+                "callback_payload_code": -1,
+                "total_videos": 2,
+                "success_videos": 1,
+                "error": "callback down",
+                "exception_type": "RuntimeError",
+            },
+        )
+    ]

@@ -24,6 +24,7 @@ Which:
 import argparse
 import collections
 import pathlib
+import random
 import time
 from typing import Any
 from collections.abc import Generator, Iterable
@@ -69,6 +70,8 @@ from cosmos_curate.pipelines.video.utils.video_pipe_input import (
 )
 
 FLAT_SHARD_DATASETS_DIR = "datasets"
+FLAT_SHARD_SAMPLE_DATASETS_DIR = "sample_datasets"
+FLAT_SHARD_SAMPLE_COUNT = 20
 
 
 def _parse_window_dimensions(item: dict[str, Any]) -> tuple[int, int]:
@@ -335,6 +338,44 @@ def _next_flat_tar_num(output_path: StoragePrefix | pathlib.Path, client_output:
     return max(existing_tar_nums, default=-1) + 1
 
 
+def _clone_clip_sample_for_sample_tar(sample: ClipSample) -> ClipSample:
+    return ClipSample(
+        uuid=sample.uuid,
+        width=sample.width,
+        height=sample.height,
+        num_frames=sample.num_frames,
+        framerate=sample.framerate,
+        num_bytes=sample.num_bytes,
+        clip_location=sample.clip_location,
+        clip_metadata=dict(sample.clip_metadata),
+        encoded_data=sample.encoded_data,
+    )
+
+
+def _build_flat_sample_task(
+    samples: list[ClipSample],
+    *,
+    output_path: str,
+    sample_count: int = FLAT_SHARD_SAMPLE_COUNT,
+) -> ShardPipeTask | None:
+    if sample_count < 1 or not samples:
+        return None
+
+    selected_samples = random.SystemRandom().sample(samples, min(sample_count, len(samples)))
+    sample_dataset_path = get_full_path(output_path, FLAT_SHARD_SAMPLE_DATASETS_DIR)
+    tar_name = webdataset_utils.make_tar_path_str(0)
+    return ShardPipeTask(
+        str(sample_dataset_path),
+        0,
+        [_clone_clip_sample_for_sample_tar(sample) for sample in selected_samples],
+        get_full_path(sample_dataset_path, tar_name),
+        get_full_path(output_path, "sample_metas", tar_name),
+        get_full_path(output_path, "sample_t5_xxl", tar_name),
+        key_count=0,
+        write_auxiliary_tars=False,
+    )
+
+
 def _group_samples_into_flat_tasks(  # noqa: PLR0913
     samples: Iterable[ClipSample],
     *,
@@ -390,6 +431,12 @@ def _group_samples_into_flat_tasks(  # noqa: PLR0913
                 key_count=0,
                 write_auxiliary_tars=False,
             ),
+        )
+    sample_task = _build_flat_sample_task(valid_samples, output_path=output_path)
+    if sample_task is not None:
+        tasks.append(sample_task)
+        logger.info(
+            f"Added flat random sample tar output={sample_task.output_tar_video}, samples={len(sample_task.samples)}"
         )
     return tasks, [flat_root], num_dropped_samples
 

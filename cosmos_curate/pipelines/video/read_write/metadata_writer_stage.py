@@ -91,6 +91,7 @@ class ClipWriterStage(CuratorStage):
         caption_models: list[str] | None = None,
         enhanced_caption_models: list[str] | None = None,
         generate_cosmos_predict_dataset: str | None = None,
+        generate_t5_embeddings: bool = True,
         vipe_pose_enabled: bool = False,
         vipe_fail_policy: str = "warn-only",
         frame_number_output_subdirs: dict[int, str] | None = None,
@@ -121,6 +122,7 @@ class ClipWriterStage(CuratorStage):
         self._caption_models = caption_models
         self._enhanced_caption_models = enhanced_caption_models
         self._generate_cosmos_predict_dataset = generate_cosmos_predict_dataset
+        self._generate_t5_embeddings = generate_t5_embeddings
         self._vipe_pose_enabled = vipe_pose_enabled
         self._vipe_fail_policy = vipe_fail_policy
         self._frame_number_output_subdirs = dict(frame_number_output_subdirs or {})
@@ -1109,7 +1111,7 @@ class ClipWriterStage(CuratorStage):
     def _write_per_window_data(self, clip: Clip) -> None:
         if self._generate_cosmos_predict_dataset == "disable":
             return
-        generate_t5_embeddings = os.environ.get("GENERATE_T5_EMBEDDINGS", "1") != "0"
+        generate_t5_embeddings = self._generate_t5_embeddings
         for window in clip.windows:
             has_pose = (
                 window.pose_intrinsics is not None and window.pose_c2w is not None and window.pose_relative is not None

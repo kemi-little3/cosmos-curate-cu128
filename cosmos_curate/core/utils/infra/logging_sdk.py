@@ -20,7 +20,7 @@ from log_sdk import LogConfig, get_client
 
 DEFAULT_APP = "darwinmind_data_engine"
 DEFAULT_SERVICE_NAME = "cosmos_curate"
-DEFAULT_LOKI_URL = "http://192.168.9.23:13100/loki/api/v1/push"
+DEFAULT_LOKI_URL = "http://192.168.9.132:3100/loki/api/v1/push"
 _ENV_ENABLE_LOKI = "COSMOS_CURATE_LOG_ENABLE_LOKI"
 _ENV_LOKI_URL = "COSMOS_CURATE_LOG_LOKI_URL"
 
